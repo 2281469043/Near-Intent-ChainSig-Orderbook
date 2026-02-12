@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "bn.js": "^5.2.2",
+    "bs58": "^6.0.0",
+    "chainsig.js": "^1.1.14",
+    "elliptic": "^6.6.1",
+    "ethers": "^6.16.0",
+    "near-api-js": "^7.1.0"
+  }
+}
