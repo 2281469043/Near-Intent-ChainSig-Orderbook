@@ -297,9 +297,3 @@ Unlike traditional AMM or order book models, this system uses **intents**:
 4. External-chain transfers happen via MPC signatures
 
 This allows **cross-chain swaps without bridges or wrapped tokens**.
-
----
-
-## License
-
-MIT
