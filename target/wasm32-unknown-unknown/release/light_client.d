@@ -1,0 +1,1 @@
+/Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/target/wasm32-unknown-unknown/release/light_client.wasm: /Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/light-client/src/lib.rs

@@ -1,1 +1,1 @@
-/Users/kaiyang/Desktop/OrderBook/Works/target/wasm32-unknown-unknown/release/orderbook_contract.wasm: /Users/kaiyang/Desktop/OrderBook/Works/orderbook-contract/src/lib.rs
+/Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/target/wasm32-unknown-unknown/release/orderbook_contract.wasm: /Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/orderbook-contract/src/lib.rs

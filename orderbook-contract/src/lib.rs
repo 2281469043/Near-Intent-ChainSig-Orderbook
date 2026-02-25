@@ -1,5 +1,5 @@
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
-use near_sdk::collections::UnorderedMap;
+use near_sdk::collections::{UnorderedMap, UnorderedSet};
 use near_sdk::{env, near_bindgen, AccountId, NearToken, PanicOnDefault, Promise, Gas, PromiseError, ext_contract};
 use near_sdk::json_types::U128;
 use near_sdk::state::ContractState;
@@ -7,23 +7,37 @@ use near_sdk::serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use hex;
 
+/// Payload discriminator for the MPC v1 `sign` method.
+/// Values are hex-encoded byte strings (e.g. "a018fc3f...").
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(crate = "near_sdk::serde")]
+pub enum PayloadV2 {
+    Ecdsa(String),
+    Eddsa(String),
+}
+
+/// Unified sign request for the MPC v1 signer contract.
+/// Both ECDSA and EdDSA go through the same `sign` method.
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(crate = "near_sdk::serde")]
 pub struct SignRequest {
-    pub payload: [u8; 32],
+    pub payload_v2: PayloadV2,
     pub path: String,
-    pub key_version: u32,
+    /// 0 = Ecdsa, 1 = Eddsa
+    pub domain_id: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(crate = "near_sdk::serde")]
 pub struct SignatureEvent {
     pub sub_intent_id: u64,
-    pub chain_type: ChainType,
-    pub payload: String, // Hex string
+    pub chain: String,
+    pub sign_scheme: String,
+    pub payload: String,
     pub big_r: String,
     pub s: String,
     pub recovery_id: u8,
+    pub signature: String,
     pub transition_memo: String,
 }
 
@@ -36,7 +50,7 @@ pub trait MultiChainSigner {
 pub trait LightClient {
     fn verify_payment_proof(
         &self,
-        chain_type: ChainType,
+        chain: String,
         proof_data: Vec<u8>,
         expected_recipient: String,
         expected_asset: String,
@@ -45,7 +59,7 @@ pub trait LightClient {
     ) -> bool;
     fn verify_transition_proof(
         &self,
-        chain_type: ChainType,
+        chain: String,
         proof_data: Vec<u8>,
         expected_recipient: String,
         expected_asset: String,
@@ -64,16 +78,26 @@ pub trait SelfContract {
         amount: U128,
         recipient: String,
         memo: String,
-    );
-    fn on_proof_verified(
-        &mut self,
-        sub_intent_id: U128,
-        payload: [u8; 32],
-        path: String,
-        transition_chain_type: ChainType,
+        tx_hash: String,
     );
     fn on_transition_verified(&mut self, sub_intent_id: U128, tx_hash: String);
-    fn on_signed(&mut self, id: u64, chain_type: ChainType, payload: [u8; 32]) -> String;
+    fn on_signed(&mut self, id: u64, chain: String, sign_scheme: String, payload: [u8; 32]) -> String;
+    fn on_deposit_signed(&mut self, id: u64, user: AccountId, asset: String, amount: U128, chain: String, sign_scheme: String, payload: [u8; 32]) -> String;
+    fn on_lock_signed(
+        &mut self,
+        id: u64,
+        user: AccountId,
+        src_asset: String,
+        src_amount: U128,
+        dst_asset: String,
+        dst_amount: U128,
+        expires_at: u64,
+        dst_address: String,
+        chain: String,
+        sign_scheme: String,
+        path: String,
+        payload: [u8; 32],
+    ) -> String;
 }
 
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
@@ -87,6 +111,14 @@ pub struct Intent {
     pub dst_asset: String,
     pub dst_amount: u128,
     pub status: IntentStatus,
+    /// Nanosecond timestamp after which this Intent expires. 0 = no expiry.
+    pub expires_at: u64,
+    /// The maker's receiving address on the destination chain (e.g. their MPC-derived address).
+    pub dst_address: String,
+    /// The maker's MPC derivation path on the source chain (e.g. "eth/1").
+    /// Used by the relayer to derive the maker's source MPC address for settlement.
+    #[serde(default)]
+    pub src_path: String,
 }
 
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone)]
@@ -109,24 +141,17 @@ pub enum IntentStatus {
     Settled,
     TransitionVerifying,
     Completed,
+    Cancelled,
 }
 
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
 #[serde(crate = "near_sdk::serde")]
 pub struct TransitionExpectation {
     pub sub_intent_id: u64,
-    pub chain_type: ChainType,
+    pub chain: String,
     pub expected_asset: String,
     pub expected_amount: u128,
     pub expected_memo: String,
-}
-
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, PartialEq, Clone, Debug)]
-#[serde(crate = "near_sdk::serde")]
-pub enum ChainType {
-    BTC,
-    ETH,
-    SOL,
 }
 
 /// Tracks a pending withdrawal so we can refund on MPC sign failure.
@@ -144,12 +169,17 @@ pub struct MatchParams {
     pub intent_id: U128,
     pub fill_amount: U128,
     pub get_amount: U128,
-    /// Hash of the external-chain transaction to be MPC-signed.
+    /// ECDSA payload: keccak256 hash (32 bytes). Used when sign_scheme == "ECDSA".
     pub payload: [u8; 32],
-    /// MPC derivation path (e.g. "eth/1", "solana-1").
+    /// MPC derivation path (e.g. "eth/1", "sui/1").
     pub path: String,
-    /// Which chain the transition (outbound transfer) targets.
-    pub transition_chain_type: ChainType,
+    /// Target chain identifier, e.g. "ETH", "SUI", "AVAX". Transparent to the contract.
+    pub chain: String,
+    /// Signing scheme: "ECDSA" or "EDDSA". Determines MPC call routing.
+    pub sign_scheme: String,
+    /// EdDSA payload: raw tx bytes for ed25519 signing (e.g. Blake2b for SUI).
+    /// Required when sign_scheme == "EDDSA".
+    pub eddsa_payload: Option<Vec<u8>>,
 }
 
 #[near_bindgen]
@@ -164,6 +194,12 @@ pub struct Orderbook {
     pub transition_expectations: UnorderedMap<u64, TransitionExpectation>,
     pub pending_withdrawals: UnorderedMap<u64, PendingWithdrawal>,
     pub next_id: u64,
+    /// Fast lookup: set of all Open intent IDs.
+    pub open_intent_ids: UnorderedSet<u64>,
+    /// Pair index: "src_asset:dst_asset" -> list of open intent IDs.
+    pub pair_index: UnorderedMap<String, Vec<u64>>,
+    /// Replay protection: set of verified deposit tx hashes.
+    pub verified_deposits: UnorderedSet<String>,
 }
 
 impl ContractState for Orderbook {}
@@ -176,13 +212,23 @@ impl Orderbook {
             owner: env::predecessor_account_id(),
             mpc_contract,
             light_client_contract,
-            balances: UnorderedMap::new(b"b"),
-            intents: UnorderedMap::new(b"i"),
-            sub_intents: UnorderedMap::new(b"s"),
-            transition_expectations: UnorderedMap::new(b"x"),
-            pending_withdrawals: UnorderedMap::new(b"w"),
+            // Disjoint prefixes prevent collection keyspace overlap.
+            balances: UnorderedMap::new(&b"balances:"[..]),
+            intents: UnorderedMap::new(&b"intents:"[..]),
+            sub_intents: UnorderedMap::new(&b"sub_intents:"[..]),
+            transition_expectations: UnorderedMap::new(&b"transition_expectations:"[..]),
+            pending_withdrawals: UnorderedMap::new(&b"pending_withdrawals:"[..]),
             next_id: 0,
+            open_intent_ids: UnorderedSet::new(&b"open_intent_ids:"[..]),
+            pair_index: UnorderedMap::new(&b"pair_index:"[..]),
+            verified_deposits: UnorderedSet::new(&b"verified_deposits:"[..]),
         }
+    }
+
+    /// State migration: wipe old state and reinitialize (testnet only).
+    #[init(ignore_state)]
+    pub fn migrate(mpc_contract: AccountId, light_client_contract: AccountId) -> Self {
+        Self::new(mpc_contract, light_client_contract)
     }
 
     // ========================================================================
@@ -199,7 +245,7 @@ impl Orderbook {
         );
         let amount: u128 = amount.into();
         let mut user_balances = self.balances.get(&user).unwrap_or_else(|| {
-            UnorderedMap::new(format!("b{}", user).as_bytes())
+            UnorderedMap::new(format!("user_balances:{}", user).as_bytes())
         });
         let current = user_balances.get(&asset).unwrap_or(0);
         user_balances.insert(&asset, &(current + amount));
@@ -208,24 +254,27 @@ impl Orderbook {
     }
 
     /// Verify an external-chain deposit to MPC address via light client, then credit balance.
+    /// `tx_hash` is the external-chain transaction hash, used for replay protection.
     #[payable]
     pub fn verify_mpc_deposit(
         &mut self,
         user: AccountId,
-        chain_type: ChainType,
+        chain: String,
         asset: String,
         amount: U128,
         recipient: String,
         memo: String,
         proof_data: Vec<u8>,
+        tx_hash: String,
     ) -> Promise {
         let expected_memo = format!("mpc:deposit:{}:{}", user, asset);
         assert_eq!(memo, expected_memo, "memo mismatch");
+        assert!(!self.verified_deposits.contains(&tx_hash), "Deposit tx_hash already verified (replay)");
 
         ext_light_client::ext(self.light_client_contract.clone())
             .with_static_gas(Gas::from_tgas(50))
             .verify_payment_proof(
-                chain_type,
+                chain,
                 proof_data,
                 recipient.clone(),
                 asset.clone(),
@@ -235,7 +284,7 @@ impl Orderbook {
             .then(
                 ext_self::ext(env::current_account_id())
                     .with_static_gas(Gas::from_tgas(30))
-                    .on_mpc_deposit_verified(user, asset, amount, recipient, memo),
+                    .on_mpc_deposit_verified(user, asset, amount, recipient, memo, tx_hash),
             )
     }
 
@@ -247,25 +296,266 @@ impl Orderbook {
         amount: U128,
         recipient: String,
         memo: String,
+        tx_hash: String,
         #[callback_result] verify_result: Result<bool, PromiseError>,
     ) -> String {
         let is_valid = verify_result.unwrap_or(false);
         if !is_valid {
             env::panic_str("MPC deposit proof invalid");
         }
+        self.verified_deposits.insert(&tx_hash);
         self.internal_transfer(user.clone(), asset.clone(), amount.0);
         env::log_str(&format!(
-            "MPC_DEPOSIT_VERIFIED:user={},asset={},amount={},recipient={},memo={}",
-            user, asset, amount.0, recipient, memo
+            "MPC_DEPOSIT_VERIFIED:user={},asset={},amount={},tx_hash={},recipient={},memo={}",
+            user, asset, amount.0, tx_hash, recipient, memo
         ));
         "MpcDepositCredited".to_string()
+    }
+
+    // ========================================================================
+    // 1b. Deposit from User's MPC Address
+    // ========================================================================
+
+    /// Moves funds from the user's personal MPC address to the contract's pool
+    /// MPC address on an external chain, and credits the user's internal balance.
+    ///
+    /// Flow:
+    ///   1. User transfers from wallet → user's MPC address (off-chain)
+    ///   2. User builds unsigned tx: user's MPC addr → pool MPC addr (off-chain)
+    ///   3. User calls this function with the payload
+    ///   4. Contract verifies path belongs to caller, triggers MPC signing
+    ///   5. On MPC success: internal balance credited + signature event emitted
+    ///   6. Relayer broadcasts the signed tx to the external chain
+    #[payable]
+    pub fn deposit_from_mpc(
+        &mut self,
+        asset: String,
+        amount: U128,
+        chain: String,
+        sign_scheme: String,
+        path: String,
+        payload: [u8; 32],
+        eddsa_payload: Option<Vec<u8>>,
+    ) -> Promise {
+        let caller = env::predecessor_account_id();
+
+        assert!(
+            path.contains(caller.as_str()),
+            "Derivation path must belong to the caller (must contain '{}')",
+            caller
+        );
+
+        let dep_id = self.next_id;
+        self.next_id += 1;
+
+        env::log_str(&format!(
+            "DepositFromMPC:user={},asset={},amount={},chain={},path={},dep_id={}",
+            caller, asset, amount.0, chain, path, dep_id
+        ));
+
+        let (request, phash) = build_sign_request(
+            &sign_scheme, &payload, &path, &eddsa_payload,
+        );
+
+        ext_signer::ext(self.mpc_contract.clone())
+            .with_attached_deposit(env::attached_deposit())
+            .with_static_gas(Gas::from_tgas(200))
+            .sign(request)
+            .then(
+                ext_self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_tgas(30))
+                    .on_deposit_signed(dep_id, caller, asset, amount, chain, sign_scheme, phash),
+            )
+    }
+
+    #[private]
+    pub fn on_deposit_signed(
+        &mut self,
+        id: u64,
+        user: AccountId,
+        asset: String,
+        amount: U128,
+        chain: String,
+        sign_scheme: String,
+        payload: [u8; 32],
+        #[callback_result] call_result: Result<SignResult, PromiseError>,
+    ) -> String {
+        match call_result {
+            Ok(res) => {
+                self.internal_transfer(user.clone(), asset.clone(), amount.into());
+
+                env::log_str(&format!(
+                    "DEPOSIT_FROM_MPC_OK:user={},asset={},amount={},dep_id={}",
+                    user, asset, amount.0, id
+                ));
+
+                let event = build_signature_event(
+                    res, id, chain, sign_scheme, payload,
+                    format!("deposit:mpc:{}", id),
+                );
+                let event_json = near_sdk::serde_json::to_string(&event).unwrap();
+                env::log_str(&format!("EVENT_JSON:{}", event_json));
+
+                "DepositSuccess".to_string()
+            }
+            Err(_) => {
+                env::log_str(&format!(
+                    "DEPOSIT_FROM_MPC_FAILED:user={},asset={},amount={},dep_id={}",
+                    user, asset, amount.0, id
+                ));
+                "DepositFailed".to_string()
+            }
+        }
+    }
+
+    // ========================================================================
+    // 1c. Lock and Make Intent (atomic deposit + intent creation)
+    // ========================================================================
+
+    /// Atomically locks funds from the user's MPC address into the contract pool
+    /// and creates an intent in one step.
+    ///
+    /// Flow:
+    ///   1. User builds unsigned tx: personal MPC addr → pool MPC addr (off-chain)
+    ///   2. User calls this function with payload + intent params
+    ///   3. Contract verifies path belongs to caller, triggers MPC signing
+    ///   4. On MPC success: credit balance → debit balance → create intent
+    ///   5. Relayer broadcasts the signed deposit tx to the external chain
+    #[payable]
+    pub fn lock_and_make_intent(
+        &mut self,
+        src_asset: String,
+        src_amount: U128,
+        dst_asset: String,
+        dst_amount: U128,
+        expires_at: u64,
+        dst_address: String,
+        chain: String,
+        sign_scheme: String,
+        path: String,
+        payload: [u8; 32],
+        eddsa_payload: Option<Vec<u8>>,
+    ) -> Promise {
+        let caller = env::predecessor_account_id();
+
+        assert!(
+            path.contains(caller.as_str()),
+            "Derivation path must belong to the caller (must contain '{}')",
+            caller
+        );
+
+        let lock_id = self.next_id;
+        self.next_id += 1;
+
+        env::log_str(&format!(
+            "LockAndMakeIntent:user={},src={}@{},dst={}@{},chain={},lock_id={}",
+            caller, src_amount.0, src_asset, dst_amount.0, dst_asset, chain, lock_id
+        ));
+
+        let (request, phash) = build_sign_request(
+            &sign_scheme, &payload, &path, &eddsa_payload,
+        );
+
+        ext_signer::ext(self.mpc_contract.clone())
+            .with_attached_deposit(env::attached_deposit())
+            .with_static_gas(Gas::from_tgas(200))
+            .sign(request)
+            .then(
+                ext_self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_tgas(30))
+                    .on_lock_signed(
+                        lock_id, caller, src_asset, src_amount,
+                        dst_asset, dst_amount, expires_at, dst_address,
+                        chain, sign_scheme, path, phash,
+                    ),
+            )
+    }
+
+    #[private]
+    pub fn on_lock_signed(
+        &mut self,
+        id: u64,
+        user: AccountId,
+        src_asset: String,
+        src_amount: U128,
+        dst_asset: String,
+        dst_amount: U128,
+        expires_at: u64,
+        dst_address: String,
+        chain: String,
+        sign_scheme: String,
+        path: String,
+        payload: [u8; 32],
+        #[callback_result] call_result: Result<SignResult, PromiseError>,
+    ) -> String {
+        match call_result {
+            Ok(res) => {
+                let src_amount_u128: u128 = src_amount.into();
+                let dst_amount_u128: u128 = dst_amount.into();
+
+                // 1) Credit internal balance (deposit)
+                self.internal_transfer(user.clone(), src_asset.clone(), src_amount_u128);
+
+                // 2) Debit and create intent
+                let mut user_balances = self.balances.get(&user).expect("User not found");
+                let current = user_balances.get(&src_asset).unwrap_or(0);
+                assert!(current >= src_amount_u128, "Insufficient balance after credit");
+                user_balances.insert(&src_asset, &(current - src_amount_u128));
+                self.balances.insert(&user, &user_balances);
+
+                let intent_id = self.next_id;
+                self.next_id += 1;
+
+                let pair_key = format!("{}:{}", src_asset, dst_asset);
+                let intent = Intent {
+                    id: intent_id,
+                    maker: user.clone(),
+                    src_asset: src_asset.clone(),
+                    src_amount: src_amount_u128,
+                    filled_amount: 0,
+                    dst_asset: dst_asset.clone(),
+                    dst_amount: dst_amount_u128,
+                    status: IntentStatus::Open,
+                    expires_at,
+                    dst_address,
+                    src_path: path,
+                };
+                self.intents.insert(&intent_id, &intent);
+                self.open_intent_ids.insert(&intent_id);
+                let mut pair_ids = self.pair_index.get(&pair_key).unwrap_or_default();
+                pair_ids.push(intent_id);
+                self.pair_index.insert(&pair_key, &pair_ids);
+
+                env::log_str(&format!(
+                    "LOCK_AND_INTENT_OK:user={},intent_id={},src={}@{},dst={}@{},lock_id={}",
+                    user, intent_id, src_amount_u128, src_asset, dst_amount_u128, dst_asset, id
+                ));
+
+                let event = build_signature_event(
+                    res, id, chain, sign_scheme, payload,
+                    format!("lock:intent:{}", intent_id),
+                );
+                let event_json = near_sdk::serde_json::to_string(&event).unwrap();
+                env::log_str(&format!("EVENT_JSON:{}", event_json));
+
+                format!("LockSuccess:intent_id={}", intent_id)
+            }
+            Err(_) => {
+                env::log_str(&format!(
+                    "LOCK_FAILED:user={},src={}@{},lock_id={}",
+                    user, src_amount.0, src_asset, id
+                ));
+                "LockFailed".to_string()
+            }
+        }
     }
 
     // ========================================================================
     // 2. Make Intent
     // ========================================================================
 
-    pub fn make_intent(&mut self, src_asset: String, src_amount: U128, dst_asset: String, dst_amount: U128) -> U128 {
+    /// `expires_at`: nanosecond timestamp after which this Intent cannot be matched. 0 = no expiry.
+    pub fn make_intent(&mut self, src_asset: String, src_amount: U128, dst_asset: String, dst_amount: U128, expires_at: u64, dst_address: String) -> U128 {
         let src_amount: u128 = src_amount.into();
         let dst_amount: u128 = dst_amount.into();
         let maker = env::predecessor_account_id();
@@ -279,6 +569,7 @@ impl Orderbook {
         let id = self.next_id;
         self.next_id += 1;
 
+        let pair_key = format!("{}:{}", src_asset, dst_asset);
         let intent = Intent {
             id,
             maker: maker.clone(),
@@ -288,58 +579,55 @@ impl Orderbook {
             dst_asset,
             dst_amount,
             status: IntentStatus::Open,
+            expires_at,
+            dst_address,
+            src_path: String::new(),
         };
         self.intents.insert(&id, &intent);
+        self.open_intent_ids.insert(&id);
+        let mut pair_ids = self.pair_index.get(&pair_key).unwrap_or_default();
+        pair_ids.push(id);
+        self.pair_index.insert(&pair_key, &pair_ids);
+
         env::log_str(&format!("Intent #{} created", id));
         U128(id.into())
     }
 
     // ========================================================================
-    // 3. Take Intent (single taker, no batch)
+    // 2b. Cancel Intent
     // ========================================================================
 
-    pub fn take_intent(&mut self, intent_id: U128, amount: U128) -> U128 {
+    /// Maker cancels an Open intent, refunding any unfilled balance.
+    pub fn cancel_intent(&mut self, intent_id: U128) {
         let intent_id: u64 = intent_id.0 as u64;
-        let amount: u128 = amount.into();
-        let taker = env::predecessor_account_id();
         let mut intent = self.intents.get(&intent_id).expect("Intent not found");
-        assert_ne!(intent.status, IntentStatus::Filled, "Intent already filled");
+        assert_eq!(intent.status, IntentStatus::Open, "Only Open intents can be cancelled");
+        assert_eq!(intent.maker, env::predecessor_account_id(), "Only maker can cancel");
 
-        let remaining = intent.src_amount - intent.filled_amount;
-        assert!(amount <= remaining, "Amount exceeds remaining balance");
-
-        intent.filled_amount += amount;
-        if intent.filled_amount == intent.src_amount {
-            intent.status = IntentStatus::Filled;
+        let refund = intent.src_amount - intent.filled_amount;
+        if refund > 0 {
+            self.internal_transfer(intent.maker.clone(), intent.src_asset.clone(), refund);
         }
+
+        intent.status = IntentStatus::Cancelled;
         self.intents.insert(&intent_id, &intent);
-
-        let sub_id = self.next_id;
-        self.next_id += 1;
-
-        let sub_intent = SubIntent {
-            id: sub_id,
-            parent_intent_id: intent_id,
-            taker: taker.clone(),
-            amount,
-            status: IntentStatus::Taken,
-        };
-        self.sub_intents.insert(&sub_id, &sub_intent);
-        U128(sub_id.into())
+        self.remove_from_open_index(intent_id, &intent.src_asset, &intent.dst_asset);
+        env::log_str(&format!("Intent #{} cancelled, refunded {}", intent_id, refund));
     }
 
     // ========================================================================
-    // 4. Batch Match + Auto MPC Sign
+    // 3. Batch Match + Auto MPC Sign
     // ========================================================================
 
-    /// Solver submits a batch of matches. After validation, the contract
-    /// automatically calls MPC to sign the corresponding external-chain
-    /// transactions. No separate `settle` call is needed.
+    /// Anyone (relayer, user, or bot) can submit a batch of matching intents.
+    /// After validation, the contract automatically calls MPC to sign the
+    /// corresponding external-chain transactions.
+    /// If intents don't match, they simply remain Open until a match is found.
     #[payable]
     pub fn batch_match_intents(&mut self, matches: Vec<MatchParams>) {
         assert!(matches.len() >= 2, "At least 2 intents required");
         assert!(matches.len() <= 6, "Max 6 intents per batch (gas limit)");
-        let solver = env::predecessor_account_id();
+        let caller = env::predecessor_account_id();
 
         let mut asset_balance: HashMap<String, i128> = HashMap::new();
         let mut sub_ids: Vec<u64> = Vec::new();
@@ -351,6 +639,9 @@ impl Orderbook {
 
             let mut intent = self.intents.get(&intent_id).expect("Intent not found");
             assert_eq!(intent.status, IntentStatus::Open, "Intent {} not open", intent_id);
+            if intent.expires_at > 0 {
+                assert!(env::block_timestamp() <= intent.expires_at, "Intent {} has expired", intent_id);
+            }
 
             let remaining_src = intent.src_amount - intent.filled_amount;
             assert!(fill_amount <= remaining_src, "Fill amount exceeds remaining balance for Intent {}", intent_id);
@@ -373,6 +664,7 @@ impl Orderbook {
             intent.filled_amount += fill_amount;
             if intent.filled_amount == intent.src_amount {
                 intent.status = IntentStatus::Filled;
+                self.remove_from_open_index(intent_id, &intent.src_asset, &intent.dst_asset);
             }
             self.intents.insert(&intent_id, &intent);
 
@@ -382,17 +674,16 @@ impl Orderbook {
             let sub_intent = SubIntent {
                 id: sub_id,
                 parent_intent_id: intent_id,
-                taker: solver.clone(),
+                taker: caller.clone(),
                 amount: fill_amount,
                 status: IntentStatus::Verifying,
             };
             self.sub_intents.insert(&sub_id, &sub_intent);
             sub_ids.push(sub_id);
 
-            // Record transition expectation
             let expectation = TransitionExpectation {
                 sub_intent_id: sub_id,
-                chain_type: m.transition_chain_type.clone(),
+                chain: m.chain.clone(),
                 expected_asset: intent.src_asset.clone(),
                 expected_amount: fill_amount,
                 expected_memo: format!("transition:sub:{}", sub_id),
@@ -430,30 +721,40 @@ impl Orderbook {
 
         for (i, m) in matches.iter().enumerate() {
             let sub_id = sub_ids[i];
-            let request = SignRequest {
-                payload: m.payload,
-                path: m.path.clone(),
-                key_version: 0,
-            };
 
-            // Each promise chain executes independently once created.
-            // We detach them so NEAR doesn't try to return a joint promise.
+            let (request, payload_hash) = build_sign_request(
+                &m.sign_scheme, &m.payload, &m.path, &m.eddsa_payload,
+            );
+
             ext_signer::ext(self.mpc_contract.clone())
                 .with_attached_deposit(NearToken::from_yoctonear(deposit_per_sign))
-                .with_static_gas(Gas::from_tgas(30))
+                .with_static_gas(Gas::from_tgas(100))
                 .sign(request)
                 .then(
                     ext_self::ext(env::current_account_id())
-                        .with_static_gas(Gas::from_tgas(15))
-                        .on_signed(sub_id, m.transition_chain_type.clone(), m.payload),
+                        .with_static_gas(Gas::from_tgas(30))
+                        .on_signed(sub_id, m.chain.clone(), m.sign_scheme.clone(), payload_hash),
                 )
                 .detach();
         }
     }
 
+    fn remove_from_open_index(&mut self, intent_id: u64, src_asset: &str, dst_asset: &str) {
+        self.open_intent_ids.remove(&intent_id);
+        let pair_key = format!("{}:{}", src_asset, dst_asset);
+        if let Some(mut pair_ids) = self.pair_index.get(&pair_key) {
+            pair_ids.retain(|&id| id != intent_id);
+            if pair_ids.is_empty() {
+                self.pair_index.remove(&pair_key);
+            } else {
+                self.pair_index.insert(&pair_key, &pair_ids);
+            }
+        }
+    }
+
     fn internal_transfer(&mut self, user: AccountId, asset: String, amount: u128) {
         let mut bals = self.balances.get(&user).unwrap_or_else(|| {
-            UnorderedMap::new(format!("b{}", user).as_bytes())
+            UnorderedMap::new(format!("user_balances:{}", user).as_bytes())
         });
         let cur = bals.get(&asset).unwrap_or(0);
         bals.insert(&asset, &(cur + amount));
@@ -461,18 +762,134 @@ impl Orderbook {
     }
 
     // ========================================================================
-    // 5. Retry Settlement (only if MPC sign failed and sub-intent rolled back)
+    // Helper: Build MPC sign request based on sign_scheme string
+    // ========================================================================
+}
+
+fn build_sign_request(
+    sign_scheme: &str,
+    payload: &[u8; 32],
+    path: &str,
+    eddsa_payload: &Option<Vec<u8>>,
+) -> (SignRequest, [u8; 32]) {
+    match sign_scheme {
+        "EDDSA" => {
+            let eddsa_bytes = eddsa_payload.as_ref()
+                .expect("EDDSA sign_scheme requires eddsa_payload");
+            assert!(
+                eddsa_bytes.len() >= 32 && eddsa_bytes.len() <= 1232,
+                "EdDSA payload must be 32..1232 bytes, got {}",
+                eddsa_bytes.len()
+            );
+            let hash = env::sha256(eddsa_bytes);
+            let mut h32 = [0u8; 32];
+            h32.copy_from_slice(&hash);
+            (SignRequest {
+                payload_v2: PayloadV2::Eddsa(hex::encode(eddsa_bytes)),
+                path: path.to_string(),
+                domain_id: 1,
+            }, h32)
+        }
+        _ => {
+            (SignRequest {
+                payload_v2: PayloadV2::Ecdsa(hex::encode(payload)),
+                path: path.to_string(),
+                domain_id: 0,
+            }, *payload)
+        }
+    }
+}
+
+/// Decompose a `SignResult` into a `SignatureEvent`.
+fn build_signature_event(
+    res: SignResult,
+    sub_intent_id: u64,
+    chain: String,
+    sign_scheme: String,
+    payload: [u8; 32],
+    transition_memo: String,
+) -> SignatureEvent {
+    match res {
+        SignResult::Ecdsa(ecdsa) => SignatureEvent {
+            sub_intent_id,
+            chain,
+            sign_scheme,
+            payload: hex::encode(payload),
+            big_r: ecdsa.big_r.affine_point,
+            s: ecdsa.s.scalar,
+            recovery_id: ecdsa.recovery_id,
+            signature: String::new(),
+            transition_memo,
+        },
+        SignResult::EddsaBytes(eddsa) => {
+            let sig_hex = hex::encode(&eddsa.signature);
+            let r_part = &sig_hex[..64];
+            let s_part = &sig_hex[64..];
+            SignatureEvent {
+                sub_intent_id,
+                chain,
+                sign_scheme,
+                payload: hex::encode(payload),
+                big_r: r_part.to_string(),
+                s: s_part.to_string(),
+                recovery_id: 0,
+                signature: sig_hex,
+                transition_memo,
+            }
+        }
+        SignResult::EddsaHex(eddsa) => {
+            let sig_hex = eddsa.signature;
+            let sig_hex = if sig_hex.starts_with("0x") { sig_hex[2..].to_string() } else { sig_hex };
+            let r_part = &sig_hex[..64];
+            let s_part = &sig_hex[64..];
+            SignatureEvent {
+                sub_intent_id,
+                chain,
+                sign_scheme,
+                payload: hex::encode(payload),
+                big_r: r_part.to_string(),
+                s: s_part.to_string(),
+                recovery_id: 0,
+                signature: sig_hex,
+                transition_memo,
+            }
+        }
+        SignResult::EddsaString(signature) => {
+            let sig_hex = if signature.starts_with("0x") { signature[2..].to_string() } else { signature };
+            let r_part = &sig_hex[..64];
+            let s_part = &sig_hex[64..];
+            SignatureEvent {
+                sub_intent_id,
+                chain,
+                sign_scheme,
+                payload: hex::encode(payload),
+                big_r: r_part.to_string(),
+                s: s_part.to_string(),
+                recovery_id: 0,
+                signature: sig_hex,
+                transition_memo,
+            }
+        }
+    }
+}
+
+#[near_bindgen]
+impl Orderbook {
+    // ========================================================================
+    // 4. Retry Settlement (only if MPC sign failed and sub-intent rolled back)
     // ========================================================================
 
     /// If MPC signing failed during batch_match and sub-intent rolled back to
-    /// Taken, the original solver (taker) can retry.
+    /// Taken, the original caller (who submitted the batch) can retry.
     #[payable]
     pub fn retry_settlement(
         &mut self,
         sub_intent_id: U128,
         payload: [u8; 32],
         path: String,
-        transition_chain_type: ChainType,
+        chain: String,
+        sign_scheme: String,
+        eddsa_payload: Option<Vec<u8>>,
     ) -> Promise {
         let sub_intent_id: u64 = sub_intent_id.0 as u64;
         let sub = self.sub_intents.get(&sub_intent_id).expect("Sub-Intent not found");
@@ -480,10 +897,9 @@ impl Orderbook {
         assert_eq!(
             sub.taker,
             env::predecessor_account_id(),
-            "Only the solver who matched can retry settlement"
+            "Only the original matcher can retry settlement"
         );
 
-        // Move to Verifying
         let mut sub_mut = sub.clone();
         sub_mut.status = IntentStatus::Verifying;
         self.sub_intents.insert(&sub_intent_id, &sub_mut);
@@ -495,7 +911,7 @@ impl Orderbook {
 
         let expectation = TransitionExpectation {
             sub_intent_id,
-            chain_type: transition_chain_type.clone(),
+            chain: chain.clone(),
             expected_asset: parent.src_asset.clone(),
             expected_amount: sub.amount,
             expected_memo: format!("transition:sub:{}", sub_intent_id),
@@ -503,134 +919,23 @@ impl Orderbook {
         self.transition_expectations
             .insert(&sub_intent_id, &expectation);
 
-        let request = SignRequest {
-            payload,
-            path,
-            key_version: 0,
-        };
+        let (request, phash) = build_sign_request(
+            &sign_scheme, &payload, &path, &eddsa_payload,
+        );
 
         ext_signer::ext(self.mpc_contract.clone())
             .with_attached_deposit(env::attached_deposit())
-            .with_static_gas(Gas::from_tgas(50))
+            .with_static_gas(Gas::from_tgas(200))
             .sign(request)
             .then(
                 ext_self::ext(env::current_account_id())
                     .with_static_gas(Gas::from_tgas(30))
-                    .on_signed(sub_intent_id, transition_chain_type, payload),
+                    .on_signed(sub_intent_id, chain, sign_scheme, phash),
             )
     }
 
     // ========================================================================
-    // 6. Submit Payment Proof (full ZK path, for future use)
-    // ========================================================================
-
-    #[payable]
-    pub fn submit_payment_proof(
-        &mut self,
-        sub_intent_id: U128,
-        proof_data: Vec<u8>,
-        payload: [u8; 32],
-        path: String,
-        payment_chain_type: ChainType,
-        transition_chain_type: ChainType,
-        recipient: String,
-        memo: String,
-    ) -> Promise {
-        let sub_intent_id: u64 = sub_intent_id.0 as u64;
-        let mut sub = self.sub_intents.get(&sub_intent_id).expect("Sub-Intent not found");
-        assert_eq!(sub.status, IntentStatus::Taken, "Sub-Intent is not in Taken state");
-        let parent = self
-            .intents
-            .get(&sub.parent_intent_id)
-            .expect("Parent intent not found");
-        let expected_amount = sub
-            .amount
-            .checked_mul(parent.dst_amount)
-            .expect("amount overflow")
-            / parent.src_amount;
-        let expected_asset = parent.dst_asset.clone();
-        let expected_memo = format!("sub:{}", sub_intent_id);
-        assert_eq!(memo, expected_memo, "memo mismatch");
-
-        sub.status = IntentStatus::Verifying;
-        self.sub_intents.insert(&sub_intent_id, &sub);
-
-        ext_light_client::ext(self.light_client_contract.clone())
-            .with_static_gas(Gas::from_tgas(50))
-            .verify_payment_proof(
-                payment_chain_type,
-                proof_data,
-                recipient,
-                expected_asset,
-                U128(expected_amount),
-                memo,
-            )
-            .then(
-                ext_self::ext(env::current_account_id())
-                    .with_static_gas(Gas::from_tgas(80))
-                    .with_attached_deposit(env::attached_deposit())
-                    .on_proof_verified(
-                        U128(sub_intent_id.into()),
-                        payload,
-                        path,
-                        transition_chain_type,
-                    ),
-            )
-    }
-
-    #[private]
-    #[payable]
-    pub fn on_proof_verified(
-        &mut self,
-        sub_intent_id: U128,
-        payload: [u8; 32],
-        path: String,
-        transition_chain_type: ChainType,
-        #[callback_result] verify_result: Result<bool, PromiseError>,
-    ) -> Promise {
-        let is_valid = verify_result.unwrap_or(false);
-        let sub_intent_id_u64: u64 = sub_intent_id.0 as u64;
-
-        if is_valid {
-            let mut sub = self.sub_intents.get(&sub_intent_id_u64).unwrap();
-            sub.status = IntentStatus::Verifying;
-            self.sub_intents.insert(&sub_intent_id_u64, &sub);
-            let parent = self
-                .intents
-                .get(&sub.parent_intent_id)
-                .expect("Parent intent not found");
-            let expectation = TransitionExpectation {
-                sub_intent_id: sub_intent_id_u64,
-                chain_type: transition_chain_type.clone(),
-                expected_asset: parent.src_asset.clone(),
-                expected_amount: sub.amount,
-                expected_memo: format!("transition:sub:{}", sub_intent_id_u64),
-            };
-            self.transition_expectations
-                .insert(&sub_intent_id_u64, &expectation);
-
-            let request = SignRequest {
-                payload,
-                path,
-                key_version: 0,
-            };
-
-            ext_signer::ext(self.mpc_contract.clone())
-                .with_attached_deposit(env::attached_deposit())
-                .with_static_gas(Gas::from_tgas(50))
-                .sign(request)
-                .then(
-                    ext_self::ext(env::current_account_id())
-                        .with_static_gas(Gas::from_tgas(30))
-                        .on_signed(sub_intent_id.0 as u64, transition_chain_type, payload),
-                )
-        } else {
-            env::panic_str("Invalid Proof");
-        }
-    }
-
-    // ========================================================================
-    // 7. Withdraw (with refund on MPC failure)
+    // 5. Withdraw (with refund on MPC failure)
     // ========================================================================
 
     #[payable]
@@ -640,7 +945,9 @@ impl Orderbook {
         amount: U128,
         payload: [u8; 32],
         path: String,
-        chain_type: ChainType,
+        chain: String,
+        sign_scheme: String,
+        eddsa_payload: Option<Vec<u8>>,
     ) -> Promise {
         let amount: u128 = amount.into();
         let user = env::predecessor_account_id();
@@ -648,11 +955,9 @@ impl Orderbook {
         let current = user_balances.get(&asset).unwrap_or(0);
         assert!(current >= amount, "Insufficient funds to withdraw");
 
-        // Deduct balance
         user_balances.insert(&asset, &(current - amount));
         self.balances.insert(&user, &user_balances);
 
-        // Track pending withdrawal so we can refund on MPC failure
         let wd_id = self.next_id;
         self.next_id += 1;
         self.pending_withdrawals.insert(
@@ -666,25 +971,77 @@ impl Orderbook {
 
         env::log_str(&format!("Withdrawing {} {} for user {} (wd_id={})", amount, asset, user, wd_id));
 
-        let request = SignRequest {
-            payload,
-            path,
-            key_version: 0,
-        };
+        let (request, phash) = build_sign_request(
+            &sign_scheme, &payload, &path, &eddsa_payload,
+        );
 
         ext_signer::ext(self.mpc_contract.clone())
             .with_attached_deposit(env::attached_deposit())
-            .with_static_gas(Gas::from_tgas(50))
+            .with_static_gas(Gas::from_tgas(200))
             .sign(request)
             .then(
                 ext_self::ext(env::current_account_id())
                     .with_static_gas(Gas::from_tgas(30))
-                    .on_signed(wd_id, chain_type, payload),
+                    .on_signed(wd_id, chain, sign_scheme, phash),
             )
     }
 
     // ========================================================================
-    // 8. Transition Verification
+    // 5b. Withdraw from User's MPC Address to External Wallet
+    // ========================================================================
+
+    /// Lets a user move funds from their personal MPC-derived address on an
+    /// external chain to any wallet they own (e.g. MetaMask, Sui Wallet).
+    ///
+    /// The caller must build the unsigned tx off-chain (from: user's MPC addr,
+    /// to: user's wallet) and pass the payload here. The contract verifies that
+    /// the derivation path belongs to the caller, then asks MPC to sign.
+    ///
+    /// Unlike `withdraw`, this does NOT touch internal balances — the funds
+    /// live on the external chain in the user's MPC address.
+    #[payable]
+    pub fn withdraw_from_mpc(
+        &mut self,
+        chain: String,
+        sign_scheme: String,
+        path: String,
+        payload: [u8; 32],
+        eddsa_payload: Option<Vec<u8>>,
+    ) -> Promise {
+        let caller = env::predecessor_account_id();
+
+        // Security: derivation path must contain the caller's account ID
+        assert!(
+            path.contains(caller.as_str()),
+            "Derivation path must belong to the caller (must contain '{}')",
+            caller
+        );
+
+        let wd_id = self.next_id;
+        self.next_id += 1;
+
+        env::log_str(&format!(
+            "WithdrawFromMPC:user={},chain={},path={},wd_id={}",
+            caller, chain, path, wd_id
+        ));
+
+        let (request, phash) = build_sign_request(
+            &sign_scheme, &payload, &path, &eddsa_payload,
+        );
+
+        ext_signer::ext(self.mpc_contract.clone())
+            .with_attached_deposit(env::attached_deposit())
+            .with_static_gas(Gas::from_tgas(200))
+            .sign(request)
+            .then(
+                ext_self::ext(env::current_account_id())
+                    .with_static_gas(Gas::from_tgas(30))
+                    .on_signed(wd_id, chain, sign_scheme, phash),
+            )
+    }
+
+    // ========================================================================
+    // 6. Transition Verification
     // ========================================================================
 
     #[payable]
@@ -708,7 +1065,7 @@ impl Orderbook {
         ext_light_client::ext(self.light_client_contract.clone())
             .with_static_gas(Gas::from_tgas(50))
             .verify_transition_proof(
-                expectation.chain_type.clone(),
+                expectation.chain.clone(),
                 proof_data,
                 recipient,
                 expectation.expected_asset.clone(),
@@ -748,56 +1105,47 @@ impl Orderbook {
     }
 
     // ========================================================================
-    // 9. MPC Sign Callback (shared by batch_match, retry, withdraw)
+    // 7. MPC Sign Callback (shared by batch_match, retry, withdraw)
     // ========================================================================
 
     #[private]
     pub fn on_signed(
         &mut self,
         id: u64,
-        chain_type: ChainType,
+        chain: String,
+        sign_scheme: String,
         payload: [u8; 32],
         #[callback_result] call_result: Result<SignResult, PromiseError>,
     ) -> String {
         match call_result {
             Ok(res) => {
-                // Sub-intent settlement flow
                 if let Some(mut sub) = self.sub_intents.get(&id) {
                     if sub.status == IntentStatus::Verifying {
                         sub.status = IntentStatus::Settled;
                         self.sub_intents.insert(&id, &sub);
                     }
                 }
-                // Withdrawal flow — just clean up tracking
                 if self.pending_withdrawals.get(&id).is_some() {
                     self.pending_withdrawals.remove(&id);
                 }
 
                 env::log_str(&format!("Operation {} Signed Trustlessly!", id));
 
-                // Emit standard event for Relayer
-                let event = SignatureEvent {
-                    sub_intent_id: id,
-                    chain_type,
-                    payload: hex::encode(payload),
-                    big_r: res.big_r.affine_point,
-                    s: res.s.scalar,
-                    recovery_id: res.recovery_id,
-                    transition_memo: format!("transition:sub:{}", id),
-                };
+                let event = build_signature_event(
+                    res, id, chain, sign_scheme, payload,
+                    format!("transition:sub:{}", id),
+                );
                 let event_json = near_sdk::serde_json::to_string(&event).unwrap();
                 env::log_str(&format!("EVENT_JSON:{}", event_json));
 
                 "Success".to_string()
             }
             Err(_) => {
-                // Sub-intent rollback
                 if let Some(mut sub) = self.sub_intents.get(&id) {
                     sub.status = IntentStatus::Taken;
                     self.sub_intents.insert(&id, &sub);
                     self.transition_expectations.remove(&id);
                 }
-                // Withdrawal refund
                 if let Some(wd) = self.pending_withdrawals.get(&id) {
                     self.internal_transfer(wd.user.clone(), wd.asset.clone(), wd.amount);
                     self.pending_withdrawals.remove(&id);
@@ -809,6 +1157,21 @@ impl Orderbook {
                 "Failed".to_string()
             }
         }
+    }
+
+    // ========================================================================
+    // 8. Cleanup completed SubIntents (release storage)
+    // ========================================================================
+
+    /// Remove a Completed SubIntent and its parent Intent (if Filled/Cancelled)
+    /// to free on-chain storage. Anyone can call this.
+    pub fn cleanup_completed(&mut self, sub_intent_id: U128) {
+        let sid = sub_intent_id.0 as u64;
+        let sub = self.sub_intents.get(&sid).expect("Sub-Intent not found");
+        assert_eq!(sub.status, IntentStatus::Completed, "Can only clean up Completed sub-intents");
+        self.sub_intents.remove(&sid);
+        self.transition_expectations.remove(&sid);
+        env::log_str(&format!("Cleaned up sub-intent #{}", sid));
     }
 
     // ========================================================================
@@ -827,20 +1190,30 @@ impl Orderbook {
         self.transition_expectations.get(&(id.0 as u64))
     }
 
+    /// Returns Open intents using the dedicated index (O(k) where k = open count).
     pub fn get_open_intents(&self, from_index: U128, limit: u64) -> Vec<Intent> {
         let from_index = from_index.0 as u64;
-        let keys = self.intents.keys_as_vector();
-        (from_index..std::cmp::min(from_index + limit, keys.len()))
-            .filter_map(|index| {
-                let id = keys.get(index).unwrap();
-                let intent = self.intents.get(&id).unwrap();
-                if intent.status == IntentStatus::Open {
-                    Some(intent)
-                } else {
-                    None
-                }
-            })
+        self.open_intent_ids
+            .iter()
+            .skip(from_index as usize)
+            .take(limit as usize)
+            .filter_map(|id| self.intents.get(&id))
             .collect()
+    }
+
+    /// Returns Open intents for a specific trading pair.
+    pub fn get_intents_by_pair(&self, src_asset: String, dst_asset: String) -> Vec<Intent> {
+        let pair_key = format!("{}:{}", src_asset, dst_asset);
+        self.pair_index
+            .get(&pair_key)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|id| self.intents.get(id))
+            .collect()
+    }
+
+    pub fn get_open_intent_count(&self) -> u64 {
+        self.open_intent_ids.len()
     }
 
     pub fn get_balance(&self, user: AccountId, asset: String) -> U128 {
@@ -855,13 +1228,47 @@ impl Orderbook {
 #[cfg(test)]
 mod tests;
 
+/// ECDSA signature result from MPC (internally tagged with "scheme":"Secp256k1").
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(crate = "near_sdk::serde")]
-pub struct SignResult {
+pub struct EcdsaSignResult {
     pub big_r: AffinePoint,
     pub s: Scalar,
     pub recovery_id: u8,
 }
+
+/// EdDSA signature result from MPC: {scheme: "Ed25519", signature: [u8; 64]}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct EddsaSignResultBytes {
+    pub signature: Vec<u8>,
+}
+
+/// EdDSA signature result where signature is a hex string.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct EddsaSignResultHex {
+    #[serde(default)]
+    pub scheme: Option<String>,
+    pub signature: String,
+}
+
+/// Unified MPC signature result — uses `#[serde(tag = "scheme")]` to match MPC signer's
+/// internally-tagged format. Falls back to untagged variants for alternative formats.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(crate = "near_sdk::serde")]
+#[serde(untagged)]
+pub enum SignResult {
+    /// {"scheme":"Secp256k1","big_r":{...},"s":{...},"recovery_id":N}
+    Ecdsa(EcdsaSignResult),
+    /// {"scheme":"Ed25519","signature":[u8;64]}  — actual MPC signer format
+    EddsaBytes(EddsaSignResultBytes),
+    /// {"scheme":"Ed25519","signature":"hex_string"} — fallback
+    EddsaHex(EddsaSignResultHex),
+    /// Just a hex string
+    EddsaString(String),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 pub struct AffinePoint {

@@ -1,0 +1,14 @@
+/Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/target/release/deps/serde-647d08481b6fccbf.d: /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/target/release/build/serde-911b8667cd27426e/out/private.rs
+
+/Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/target/release/deps/libserde-647d08481b6fccbf.rlib: /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/target/release/build/serde-911b8667cd27426e/out/private.rs
+
+/Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/target/release/deps/libserde-647d08481b6fccbf.rmeta: /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/target/release/build/serde-911b8667cd27426e/out/private.rs
+
+/Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/kaiyang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/target/release/build/serde-911b8667cd27426e/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/kaiyang/Desktop/OrderBook/Near-Intent-ChainSig-Orderbook/target/release/build/serde-911b8667cd27426e/out

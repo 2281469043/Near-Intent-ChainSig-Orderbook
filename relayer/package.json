@@ -1,0 +1,18 @@
+{
+  "name": "orderbook-relayer",
+  "version": "1.0.0",
+  "description": "Off-chain relayer for the NEAR Chain Signatures cross-chain orderbook",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "start:once": "RUN_ONCE=true node src/index.js"
+  },
+  "dependencies": {
+    "@mysten/sui": "^1.0.0",
+    "@noble/hashes": "^1.8.0",
+    "bs58": "^5.0.0",
+    "chainsig.js": "^1.1.14",
+    "ethers": "^6.16.0",
+    "near-api-js": "^5.0.1"
+  }
+}

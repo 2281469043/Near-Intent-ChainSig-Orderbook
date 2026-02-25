@@ -145,8 +145,11 @@ async function cmdBroadcast(args) {
   try {
     const txResponse = await provider.broadcastTransaction(signedSerialized);
     console.error(`Transaction broadcast! Tx Hash: ${txResponse.hash}`);
-    console.error(`Waiting for confirmation...`);
-    const receipt = await txResponse.wait(1);
+    console.error(`Waiting for confirmation (timeout 90s)...`);
+    const receipt = await Promise.race([
+      txResponse.wait(1),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("Confirmation timeout after 90s — tx may still confirm later")), 90000)),
+    ]);
     console.error(
       `Transaction confirmed! Block: ${receipt.blockNumber}, Gas Used: ${receipt.gasUsed}`
     );

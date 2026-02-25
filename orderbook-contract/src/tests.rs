@@ -12,7 +12,7 @@ fn mpc_contract() -> AccountId { accounts(0) }
 fn light_client_contract() -> AccountId { accounts(1) }
 fn orderbook_contract() -> AccountId { accounts(2) }
 fn user_alice() -> AccountId { accounts(4) }
-fn solver_bob() -> AccountId { accounts(5) }
+fn user_bob() -> AccountId { accounts(5) }
 fn user_charlie() -> AccountId { AccountId::from_str("charlie.testnet").unwrap() }
 fn user_dave() -> AccountId { AccountId::from_str("dave.testnet").unwrap() }
 fn u(v: u128) -> U128 { U128(v) }
@@ -24,11 +24,10 @@ fn get_context(predecessor: AccountId, deposit: NearToken) -> VMContextBuilder {
         .signer_account_id(predecessor.clone())
         .predecessor_account_id(predecessor)
         .attached_deposit(deposit)
-        .prepaid_gas(Gas::from_tgas(300));
+        .prepaid_gas(Gas::from_tgas(3000));
     builder
 }
 
-/// Create a fresh contract. Owner = orderbook_contract().
 fn new_contract() -> (Orderbook, VMContextBuilder) {
     let context = get_context(orderbook_contract(), NearToken::from_near(0));
     testing_env!(context.build());
@@ -36,15 +35,20 @@ fn new_contract() -> (Orderbook, VMContextBuilder) {
     (contract, context)
 }
 
-fn mock_sig() -> SignResult {
-    SignResult {
+fn mock_ecdsa_sig() -> SignResult {
+    SignResult::Ecdsa(EcdsaSignResult {
         big_r: AffinePoint { affine_point: "mock_r".to_string() },
         s: Scalar { scalar: "mock_s".to_string() },
         recovery_id: 1,
-    }
+    })
 }
 
-/// Build MatchParams with default signing fields.
+fn mock_eddsa_sig() -> SignResult {
+    SignResult::EddsaBytes(EddsaSignResultBytes {
+        signature: vec![0xaa; 64],
+    })
+}
+
 fn mp(intent_id: U128, fill: u128, get: u128) -> MatchParams {
     MatchParams {
         intent_id,
@@ -52,25 +56,34 @@ fn mp(intent_id: U128, fill: u128, get: u128) -> MatchParams {
         get_amount: u(get),
         payload: [1u8; 32],
         path: "default/path".to_string(),
-        transition_chain_type: ChainType::ETH,
+        chain: "ETH".to_string(),
+        sign_scheme: "ECDSA".to_string(),
+        eddsa_payload: None,
     }
 }
 
-fn mp_with_chain(intent_id: U128, fill: u128, get: u128, chain: ChainType) -> MatchParams {
+fn mp_chain(intent_id: U128, fill: u128, get: u128, chain: &str, scheme: &str) -> MatchParams {
+    let eddsa_payload = if scheme == "EDDSA" { Some(vec![42u8; 64]) } else { None };
     MatchParams {
         intent_id,
         fill_amount: u(fill),
         get_amount: u(get),
         payload: [1u8; 32],
         path: "default/path".to_string(),
-        transition_chain_type: chain,
+        chain: chain.to_string(),
+        sign_scheme: scheme.to_string(),
+        eddsa_payload,
     }
 }
 
-/// Owner deposits for a user. Caller must have set predecessor to owner beforehand.
 fn owner_deposit(contract: &mut Orderbook, context: &mut VMContextBuilder, user: &AccountId, asset: &str, amount: u128) {
     testing_env!(context.predecessor_account_id(orderbook_contract()).build());
     contract.deposit_for(user.clone(), asset.to_string(), u(amount));
+}
+
+fn make(contract: &mut Orderbook, context: &mut VMContextBuilder, user: &AccountId, src: &str, src_amt: u128, dst: &str, dst_amt: u128, dst_addr: &str) -> U128 {
+    testing_env!(context.predecessor_account_id(user.clone()).build());
+    contract.make_intent(src.to_string(), u(src_amt), dst.to_string(), u(dst_amt), 0, dst_addr.to_string())
 }
 
 // ============================================================================
@@ -87,19 +100,19 @@ fn test_deposit_basic() {
 #[test]
 fn test_deposit_accumulates() {
     let (mut contract, mut context) = new_contract();
-    owner_deposit(&mut contract, &mut context, &user_alice(), "SOL", 100);
-    owner_deposit(&mut contract, &mut context, &user_alice(), "SOL", 200);
-    assert_eq!(contract.get_balance(user_alice(), "SOL".to_string()), u(300));
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 100);
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 200);
+    assert_eq!(contract.get_balance(user_alice(), "SUI".to_string()), u(300));
 }
 
 #[test]
 fn test_deposit_multiple_assets() {
     let (mut contract, mut context) = new_contract();
     owner_deposit(&mut contract, &mut context, &user_alice(), "ETH", 100);
-    owner_deposit(&mut contract, &mut context, &user_alice(), "SOL", 200);
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 200);
     owner_deposit(&mut contract, &mut context, &user_alice(), "BTC", 50);
     assert_eq!(contract.get_balance(user_alice(), "ETH".to_string()), u(100));
-    assert_eq!(contract.get_balance(user_alice(), "SOL".to_string()), u(200));
+    assert_eq!(contract.get_balance(user_alice(), "SUI".to_string()), u(200));
     assert_eq!(contract.get_balance(user_alice(), "BTC".to_string()), u(50));
 }
 
@@ -107,9 +120,9 @@ fn test_deposit_multiple_assets() {
 fn test_deposit_multiple_users_isolated() {
     let (mut contract, mut context) = new_contract();
     owner_deposit(&mut contract, &mut context, &user_alice(), "ETH", 100);
-    owner_deposit(&mut contract, &mut context, &solver_bob(), "ETH", 200);
+    owner_deposit(&mut contract, &mut context, &user_bob(), "ETH", 200);
     assert_eq!(contract.get_balance(user_alice(), "ETH".to_string()), u(100));
-    assert_eq!(contract.get_balance(solver_bob(), "ETH".to_string()), u(200));
+    assert_eq!(contract.get_balance(user_bob(), "ETH".to_string()), u(200));
     assert_eq!(contract.get_balance(user_charlie(), "ETH".to_string()), u(0));
 }
 
@@ -117,7 +130,6 @@ fn test_deposit_multiple_users_isolated() {
 #[should_panic(expected = "Only owner can call deposit_for")]
 fn test_deposit_for_not_owner_panics() {
     let (mut contract, mut context) = new_contract();
-    // Alice tries to call deposit_for — she is NOT the owner
     testing_env!(context.predecessor_account_id(user_alice()).build());
     contract.deposit_for(user_alice(), "ETH".to_string(), u(100));
 }
@@ -128,13 +140,14 @@ fn test_deposit_via_mpc_verification_callback() {
     testing_env!(context.predecessor_account_id(orderbook_contract()).build());
     let user = user_alice();
     let result = contract.on_mpc_deposit_verified(
-        user.clone(), "SOL".to_string(), U128(500),
-        "mpc-sol-addr".to_string(),
-        format!("mpc:deposit:{}:SOL", user),
+        user.clone(), "SUI".to_string(), U128(500),
+        "mpc-sui-addr".to_string(),
+        format!("mpc:deposit:{}:SUI", user),
+        "tx-1".to_string(),
         Ok(true),
     );
     assert_eq!(result, "MpcDepositCredited");
-    assert_eq!(contract.get_balance(user, "SOL".to_string()), u(500));
+    assert_eq!(contract.get_balance(user, "SUI".to_string()), u(500));
 }
 
 #[test]
@@ -143,8 +156,9 @@ fn test_deposit_via_mpc_verification_rejected() {
     let (mut contract, mut context) = new_contract();
     testing_env!(context.predecessor_account_id(orderbook_contract()).build());
     contract.on_mpc_deposit_verified(
-        user_alice(), "SOL".to_string(), U128(500),
-        "addr".to_string(), "mpc:deposit:x:SOL".to_string(),
+        user_alice(), "SUI".to_string(), U128(500),
+        "addr".to_string(), "mpc:deposit:x:SUI".to_string(),
+        "tx-2".to_string(),
         Ok(false),
     );
 }
@@ -156,119 +170,59 @@ fn test_deposit_via_mpc_verification_rejected() {
 #[test]
 fn test_make_intent_basic() {
     let (mut contract, mut context) = new_contract();
-    owner_deposit(&mut contract, &mut context, &user_alice(), "SOL", 1000);
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 1000);
 
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    let id = contract.make_intent("SOL".to_string(), u(500), "ETH".to_string(), u(100));
+    let id = make(&mut contract, &mut context, &user_alice(), "SUI", 500, "ETH", 100, "0xalice_eth");
 
     let intent = contract.get_intent(id).unwrap();
     assert_eq!(intent.maker, user_alice());
     assert_eq!(intent.src_amount, 500);
     assert_eq!(intent.filled_amount, 0);
     assert_eq!(intent.status, IntentStatus::Open);
-    assert_eq!(contract.get_balance(user_alice(), "SOL".to_string()), u(500));
+    assert_eq!(intent.dst_address, "0xalice_eth");
+    assert_eq!(contract.get_balance(user_alice(), "SUI".to_string()), u(500));
 }
 
 #[test]
 #[should_panic(expected = "Insufficient balance")]
 fn test_make_intent_insufficient_balance() {
     let (mut contract, mut context) = new_contract();
-    owner_deposit(&mut contract, &mut context, &user_alice(), "SOL", 100);
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    contract.make_intent("SOL".to_string(), u(200), "ETH".to_string(), u(50));
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 100);
+    make(&mut contract, &mut context, &user_alice(), "SUI", 200, "ETH", 50, "addr");
 }
 
 #[test]
 #[should_panic(expected = "User not found")]
 fn test_make_intent_no_deposit() {
     let (mut contract, mut context) = new_contract();
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    contract.make_intent("SOL".to_string(), u(100), "ETH".to_string(), u(50));
+    make(&mut contract, &mut context, &user_alice(), "SUI", 100, "ETH", 50, "addr");
 }
 
 #[test]
 fn test_make_multiple_intents_same_user() {
     let (mut contract, mut context) = new_contract();
-    owner_deposit(&mut contract, &mut context, &user_alice(), "SOL", 1000);
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    let id1 = contract.make_intent("SOL".to_string(), u(300), "ETH".to_string(), u(30));
-    let id2 = contract.make_intent("SOL".to_string(), u(400), "BTC".to_string(), u(1));
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 1000);
+    let id1 = make(&mut contract, &mut context, &user_alice(), "SUI", 300, "ETH", 30, "addr1");
+    let id2 = make(&mut contract, &mut context, &user_alice(), "SUI", 400, "BTC", 1, "addr2");
     assert_ne!(id1.0, id2.0);
-    assert_eq!(contract.get_balance(user_alice(), "SOL".to_string()), u(300));
+    assert_eq!(contract.get_balance(user_alice(), "SUI".to_string()), u(300));
 }
 
 // ============================================================================
-// 3. TAKE INTENT TESTS
-// ============================================================================
-
-#[test]
-fn test_take_intent_partial() {
-    let (mut contract, mut context) = new_contract();
-    owner_deposit(&mut contract, &mut context, &user_alice(), "BTC", 100);
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    let intent_id = contract.make_intent("BTC".to_string(), u(100), "ETH".to_string(), u(1000));
-
-    testing_env!(context.predecessor_account_id(solver_bob()).build());
-    let sub_id = contract.take_intent(intent_id, u(30));
-
-    let intent = contract.get_intent(intent_id).unwrap();
-    assert_eq!(intent.filled_amount, 30);
-    assert_eq!(intent.status, IntentStatus::Open);
-    assert_eq!(contract.get_sub_intent(sub_id).unwrap().status, IntentStatus::Taken);
-}
-
-#[test]
-fn test_take_intent_full() {
-    let (mut contract, mut context) = new_contract();
-    owner_deposit(&mut contract, &mut context, &user_alice(), "BTC", 100);
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    let intent_id = contract.make_intent("BTC".to_string(), u(100), "ETH".to_string(), u(1000));
-    testing_env!(context.predecessor_account_id(solver_bob()).build());
-    contract.take_intent(intent_id, u(100));
-    assert_eq!(contract.get_intent(intent_id).unwrap().status, IntentStatus::Filled);
-}
-
-#[test]
-#[should_panic(expected = "Amount exceeds remaining balance")]
-fn test_take_intent_exceeds_remaining() {
-    let (mut contract, mut context) = new_contract();
-    owner_deposit(&mut contract, &mut context, &user_alice(), "BTC", 100);
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    let intent_id = contract.make_intent("BTC".to_string(), u(100), "ETH".to_string(), u(1000));
-    testing_env!(context.predecessor_account_id(solver_bob()).build());
-    contract.take_intent(intent_id, u(60));
-    contract.take_intent(intent_id, u(50));
-}
-
-#[test]
-#[should_panic(expected = "Intent already filled")]
-fn test_take_intent_already_filled() {
-    let (mut contract, mut context) = new_contract();
-    owner_deposit(&mut contract, &mut context, &user_alice(), "BTC", 100);
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    let intent_id = contract.make_intent("BTC".to_string(), u(100), "ETH".to_string(), u(1000));
-    testing_env!(context.predecessor_account_id(solver_bob()).build());
-    contract.take_intent(intent_id, u(100));
-    contract.take_intent(intent_id, u(1));
-}
-
-// ============================================================================
-// 4. BATCH MATCH TESTS (now auto-triggers MPC)
+// 3. BATCH MATCH TESTS
 // ============================================================================
 
 #[test]
 fn test_batch_match_simple_swap() {
     let (mut contract, mut context) = new_contract();
     let alice = user_alice();
-    let bob = solver_bob();
+    let bob = user_bob();
 
-    owner_deposit(&mut contract, &mut context, &alice, "SOL", 100);
+    owner_deposit(&mut contract, &mut context, &alice, "SUI", 100);
     owner_deposit(&mut contract, &mut context, &bob, "ETH", 100);
 
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id1 = contract.make_intent("SOL".to_string(), u(100), "ETH".to_string(), u(100));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id2 = contract.make_intent("ETH".to_string(), u(100), "SOL".to_string(), u(100));
+    let id1 = make(&mut contract, &mut context, &alice, "SUI", 100, "ETH", 100, "alice_eth");
+    let id2 = make(&mut contract, &mut context, &bob, "ETH", 100, "SUI", 100, "bob_sui");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
@@ -278,7 +232,7 @@ fn test_batch_match_simple_swap() {
     let _ = contract.batch_match_intents(vec![mp(id1, 100, 100), mp(id2, 100, 100)]);
 
     assert_eq!(contract.get_balance(alice, "ETH".to_string()), u(100));
-    assert_eq!(contract.get_balance(bob, "SOL".to_string()), u(100));
+    assert_eq!(contract.get_balance(bob, "SUI".to_string()), u(100));
     assert_eq!(contract.get_intent(id1).unwrap().status, IntentStatus::Filled);
 }
 
@@ -286,15 +240,13 @@ fn test_batch_match_simple_swap() {
 fn test_batch_match_partial_fill() {
     let (mut contract, mut context) = new_contract();
     let alice = user_alice();
-    let bob = solver_bob();
+    let bob = user_bob();
 
     owner_deposit(&mut contract, &mut context, &alice, "A", 100);
     owner_deposit(&mut contract, &mut context, &bob, "B", 100);
 
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id1 = contract.make_intent("A".to_string(), u(100), "B".to_string(), u(100));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id2 = contract.make_intent("B".to_string(), u(50), "A".to_string(), u(50));
+    let id1 = make(&mut contract, &mut context, &alice, "A", 100, "B", 100, "addr_a");
+    let id2 = make(&mut contract, &mut context, &bob, "B", 50, "A", 50, "addr_b");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
@@ -306,26 +258,23 @@ fn test_batch_match_partial_fill() {
     assert_eq!(contract.get_balance(alice, "B".to_string()), u(50));
     let i1 = contract.get_intent(id1).unwrap();
     assert_eq!(i1.filled_amount, 50);
-    assert_eq!(i1.status, IntentStatus::Open); // Partial
+    assert_eq!(i1.status, IntentStatus::Open);
 }
 
 #[test]
 fn test_batch_match_3way_ring() {
     let (mut contract, mut context) = new_contract();
     let alice = user_alice();
-    let bob = solver_bob();
+    let bob = user_bob();
     let charlie = user_charlie();
 
     owner_deposit(&mut contract, &mut context, &alice, "BTC", 100);
     owner_deposit(&mut contract, &mut context, &bob, "ETH", 1000);
-    owner_deposit(&mut contract, &mut context, &charlie, "SOL", 500);
+    owner_deposit(&mut contract, &mut context, &charlie, "SUI", 500);
 
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id1 = contract.make_intent("BTC".to_string(), u(100), "ETH".to_string(), u(1000));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id2 = contract.make_intent("ETH".to_string(), u(1000), "SOL".to_string(), u(500));
-    testing_env!(context.predecessor_account_id(charlie.clone()).build());
-    let id3 = contract.make_intent("SOL".to_string(), u(500), "BTC".to_string(), u(100));
+    let id1 = make(&mut contract, &mut context, &alice, "BTC", 100, "ETH", 1000, "alice_eth");
+    let id2 = make(&mut contract, &mut context, &bob, "ETH", 1000, "SUI", 500, "bob_sui");
+    let id3 = make(&mut contract, &mut context, &charlie, "SUI", 500, "BTC", 100, "charlie_btc");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
@@ -335,7 +284,7 @@ fn test_batch_match_3way_ring() {
     let _ = contract.batch_match_intents(vec![mp(id1, 100, 1000), mp(id2, 1000, 500), mp(id3, 500, 100)]);
 
     assert_eq!(contract.get_balance(alice, "ETH".to_string()), u(1000));
-    assert_eq!(contract.get_balance(bob, "SOL".to_string()), u(500));
+    assert_eq!(contract.get_balance(bob, "SUI".to_string()), u(500));
     assert_eq!(contract.get_balance(charlie, "BTC".to_string()), u(100));
 }
 
@@ -343,17 +292,14 @@ fn test_batch_match_3way_ring() {
 fn test_batch_match_sub_intents_start_as_verifying() {
     let (mut contract, mut context) = new_contract();
     let alice = user_alice();
-    let bob = solver_bob();
+    let bob = user_bob();
 
     owner_deposit(&mut contract, &mut context, &alice, "A", 100);
     owner_deposit(&mut contract, &mut context, &bob, "B", 100);
 
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id1 = contract.make_intent("A".to_string(), u(100), "B".to_string(), u(100));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id2 = contract.make_intent("B".to_string(), u(100), "A".to_string(), u(100));
+    let id1 = make(&mut contract, &mut context, &alice, "A", 100, "B", 100, "a_addr");
+    let id2 = make(&mut contract, &mut context, &bob, "B", 100, "A", 100, "b_addr");
 
-    // IDs: id1=0, id2=1, sub for id1=2, sub for id2=3
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
         .attached_deposit(NearToken::from_near(1))
@@ -361,11 +307,8 @@ fn test_batch_match_sub_intents_start_as_verifying() {
     );
     let _ = contract.batch_match_intents(vec![mp(id1, 100, 100), mp(id2, 100, 100)]);
 
-    // Sub-intents start as Verifying (MPC sign auto-triggered)
     assert_eq!(contract.get_sub_intent(u(2)).unwrap().status, IntentStatus::Verifying);
     assert_eq!(contract.get_sub_intent(u(3)).unwrap().status, IntentStatus::Verifying);
-
-    // Transition expectations recorded
     assert!(contract.get_transition_expectation(u(2)).is_some());
     assert!(contract.get_transition_expectation(u(3)).is_some());
 }
@@ -375,8 +318,7 @@ fn test_batch_match_sub_intents_start_as_verifying() {
 fn test_batch_match_single_intent_panics() {
     let (mut contract, mut context) = new_contract();
     owner_deposit(&mut contract, &mut context, &user_alice(), "A", 100);
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    let id1 = contract.make_intent("A".to_string(), u(100), "B".to_string(), u(100));
+    let id1 = make(&mut contract, &mut context, &user_alice(), "A", 100, "B", 100, "addr");
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
         .attached_deposit(NearToken::from_near(1))
@@ -390,12 +332,10 @@ fn test_batch_match_single_intent_panics() {
 fn test_batch_match_insolvent_panics() {
     let (mut contract, mut context) = new_contract();
     owner_deposit(&mut contract, &mut context, &user_alice(), "A", 100);
-    owner_deposit(&mut contract, &mut context, &solver_bob(), "B", 100);
+    owner_deposit(&mut contract, &mut context, &user_bob(), "B", 100);
 
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    let id1 = contract.make_intent("A".to_string(), u(100), "B".to_string(), u(100));
-    testing_env!(context.predecessor_account_id(solver_bob()).build());
-    let id2 = contract.make_intent("B".to_string(), u(100), "A".to_string(), u(100));
+    let id1 = make(&mut contract, &mut context, &user_alice(), "A", 100, "B", 100, "a");
+    let id2 = make(&mut contract, &mut context, &user_bob(), "B", 100, "A", 100, "b");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
@@ -410,86 +350,78 @@ fn test_batch_match_insolvent_panics() {
 fn test_batch_match_bad_price_panics() {
     let (mut contract, mut context) = new_contract();
     owner_deposit(&mut contract, &mut context, &user_alice(), "A", 100);
-    owner_deposit(&mut contract, &mut context, &solver_bob(), "B", 100);
+    owner_deposit(&mut contract, &mut context, &user_bob(), "B", 100);
 
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    let id1 = contract.make_intent("A".to_string(), u(100), "B".to_string(), u(100));
-    testing_env!(context.predecessor_account_id(solver_bob()).build());
-    let id2 = contract.make_intent("B".to_string(), u(100), "A".to_string(), u(100));
+    let id1 = make(&mut contract, &mut context, &user_alice(), "A", 100, "B", 100, "a");
+    let id2 = make(&mut contract, &mut context, &user_bob(), "B", 100, "A", 100, "b");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
         .attached_deposit(NearToken::from_near(1))
         .build()
     );
-    // Give Alice only 90 B — worse than her 1:1 price
     let _ = contract.batch_match_intents(vec![mp(id1, 100, 90), mp(id2, 100, 100)]);
 }
 
 // ============================================================================
-// 5. FULL LIFECYCLE: BATCH_MATCH → ON_SIGNED → TRANSITION VERIFY
+// 4. FULL LIFECYCLE: BATCH_MATCH → ON_SIGNED → TRANSITION VERIFY
 // ============================================================================
 
 #[test]
 fn test_full_lifecycle_2party() {
     let (mut contract, mut context) = new_contract();
     let alice = user_alice();
-    let bob = solver_bob();
+    let bob = user_bob();
 
-    // 1. Deposit
     testing_env!(context.predecessor_account_id(orderbook_contract()).build());
     contract.on_mpc_deposit_verified(
-        alice.clone(), "SOL".to_string(), U128(1000),
-        "alice-mpc".to_string(), format!("mpc:deposit:{}:SOL", alice), Ok(true),
+        alice.clone(), "SUI".to_string(), U128(1000),
+        "alice-mpc".to_string(), format!("mpc:deposit:{}:SUI", alice), "tx-3".to_string(), Ok(true),
     );
     contract.on_mpc_deposit_verified(
         bob.clone(), "ETH".to_string(), U128(500),
-        "bob-mpc".to_string(), format!("mpc:deposit:{}:ETH", bob), Ok(true),
+        "bob-mpc".to_string(), format!("mpc:deposit:{}:ETH", bob), "tx-4".to_string(), Ok(true),
     );
 
-    // 2. Make intents
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id_a = contract.make_intent("SOL".to_string(), u(1000), "ETH".to_string(), u(500));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id_b = contract.make_intent("ETH".to_string(), u(500), "SOL".to_string(), u(1000));
+    let id_a = make(&mut contract, &mut context, &alice, "SUI", 1000, "ETH", 500, "alice_eth_mpc");
+    let id_b = make(&mut contract, &mut context, &bob, "ETH", 500, "SUI", 1000, "bob_sui_mpc");
 
-    // 3. Batch match (auto-triggers MPC)
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
         .attached_deposit(NearToken::from_near(1))
         .build()
     );
     let _ = contract.batch_match_intents(vec![
-        mp_with_chain(id_a, 1000, 500, ChainType::SOL),
-        mp_with_chain(id_b, 500, 1000, ChainType::ETH),
+        mp_chain(id_a, 1000, 500, "SUI", "EDDSA"),
+        mp_chain(id_b, 500, 1000, "ETH", "ECDSA"),
     ]);
 
     assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(500));
-    assert_eq!(contract.get_balance(bob.clone(), "SOL".to_string()), u(1000));
+    assert_eq!(contract.get_balance(bob.clone(), "SUI".to_string()), u(1000));
 
     let sub_a = u(2);
     let sub_b = u(3);
     assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Verifying);
 
-    // 4. MPC sign callbacks
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    let r = contract.on_signed(2, ChainType::SOL, [1u8; 32], Ok(mock_sig()));
+    // MPC sign callbacks
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    let r = contract.on_signed(2, "SUI".to_string(), "EDDSA".to_string(), [1u8; 32], Ok(mock_eddsa_sig()));
     assert_eq!(r, "Success");
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(3, ChainType::ETH, [1u8; 32], Ok(mock_sig()));
+    testing_env!(context.prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_signed(3, "ETH".to_string(), "ECDSA".to_string(), [1u8; 32], Ok(mock_ecdsa_sig()));
 
     assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Settled);
     assert_eq!(contract.get_sub_intent(sub_b).unwrap().status, IntentStatus::Settled);
 
-    // 5. Transition verify
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
+    // Transition verify
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
     let _ = contract.verify_transition_completion(sub_a, vec![1], "addr-a".to_string(), "tx-a".to_string());
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
+    testing_env!(context.prepaid_gas(Gas::from_tgas(3000)).build());
     let _ = contract.verify_transition_completion(sub_b, vec![1], "addr-b".to_string(), "tx-b".to_string());
 
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
     contract.on_transition_verified(sub_a, "tx-a".to_string(), Ok(true));
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
+    testing_env!(context.prepaid_gas(Gas::from_tgas(3000)).build());
     contract.on_transition_verified(sub_b, "tx-b".to_string(), Ok(true));
 
     assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Completed);
@@ -497,108 +429,18 @@ fn test_full_lifecycle_2party() {
     assert!(contract.get_transition_expectation(sub_a).is_none());
 }
 
-#[test]
-fn test_full_lifecycle_3party_sol_eth() {
-    let (mut contract, mut context) = new_contract();
-    let alice = user_alice();
-    let bob = solver_bob();
-    let solver = user_charlie();
-
-    let alice_sol: u128 = 1_000_000_000;
-    let alice_want_eth: u128 = 10_000_000_000_000_000;
-    let bob_eth: u128 = 100_000_000_000_000_000;
-    let bob_want_sol: u128 = 10_000_000_000;
-    let solver_sol: u128 = bob_want_sol - alice_sol;
-    let solver_want_eth: u128 = bob_eth - alice_want_eth;
-
-    // Deposits
-    testing_env!(context.predecessor_account_id(orderbook_contract()).build());
-    contract.on_mpc_deposit_verified(alice.clone(), "SOL".to_string(), U128(alice_sol), "a".to_string(), format!("mpc:deposit:{}:SOL", alice), Ok(true));
-    contract.on_mpc_deposit_verified(bob.clone(), "ETH".to_string(), U128(bob_eth), "b".to_string(), format!("mpc:deposit:{}:ETH", bob), Ok(true));
-    contract.on_mpc_deposit_verified(solver.clone(), "SOL".to_string(), U128(solver_sol), "s".to_string(), format!("mpc:deposit:{}:SOL", solver), Ok(true));
-
-    // Intents
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id_a = contract.make_intent("SOL".to_string(), u(alice_sol), "ETH".to_string(), u(alice_want_eth));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id_b = contract.make_intent("ETH".to_string(), u(bob_eth), "SOL".to_string(), u(bob_want_sol));
-    testing_env!(context.predecessor_account_id(solver.clone()).build());
-    let id_s = contract.make_intent("SOL".to_string(), u(solver_sol), "ETH".to_string(), u(solver_want_eth));
-
-    // Batch match
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .attached_deposit(NearToken::from_near(1))
-        .build()
-    );
-    let _ = contract.batch_match_intents(vec![
-        mp_with_chain(id_a, alice_sol, alice_want_eth, ChainType::SOL),
-        mp_with_chain(id_b, bob_eth, bob_want_sol, ChainType::ETH),
-        mp_with_chain(id_s, solver_sol, solver_want_eth, ChainType::SOL),
-    ]);
-
-    // Conservation check
-    assert_eq!(alice_sol + solver_sol, bob_want_sol);
-    assert_eq!(bob_eth, alice_want_eth + solver_want_eth);
-
-    assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(alice_want_eth));
-    assert_eq!(contract.get_balance(bob.clone(), "SOL".to_string()), u(bob_want_sol));
-    assert_eq!(contract.get_balance(solver.clone(), "ETH".to_string()), u(solver_want_eth));
-
-    // Sub-intents: 0,1,2 = intents, 3,4,5 = sub-intents
-    let sub_a = u(3);
-    let sub_b = u(4);
-    let sub_s = u(5);
-
-    // MPC sign callbacks
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(3, ChainType::SOL, [1u8; 32], Ok(mock_sig()));
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(4, ChainType::ETH, [1u8; 32], Ok(mock_sig()));
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(5, ChainType::SOL, [1u8; 32], Ok(mock_sig()));
-
-    assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Settled);
-    assert_eq!(contract.get_sub_intent(sub_b).unwrap().status, IntentStatus::Settled);
-    assert_eq!(contract.get_sub_intent(sub_s).unwrap().status, IntentStatus::Settled);
-
-    // Transition verify
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    let _ = contract.verify_transition_completion(sub_a, vec![1], "a".to_string(), "tx-a".to_string());
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    let _ = contract.verify_transition_completion(sub_b, vec![1], "b".to_string(), "tx-b".to_string());
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    let _ = contract.verify_transition_completion(sub_s, vec![1], "s".to_string(), "tx-s".to_string());
-
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_transition_verified(sub_a, "tx-a".to_string(), Ok(true));
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_transition_verified(sub_b, "tx-b".to_string(), Ok(true));
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_transition_verified(sub_s, "tx-s".to_string(), Ok(true));
-
-    assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Completed);
-    assert_eq!(contract.get_sub_intent(sub_b).unwrap().status, IntentStatus::Completed);
-    assert_eq!(contract.get_sub_intent(sub_s).unwrap().status, IntentStatus::Completed);
-}
-
 // ============================================================================
-// 6. MPC SIGN FAILURE & ROLLBACK
+// 5. MPC SIGN FAILURE & ROLLBACK
 // ============================================================================
 
 #[test]
 fn test_mpc_sign_failure_rollback_to_taken() {
     let (mut contract, mut context) = new_contract();
-    let alice = user_alice();
-    let bob = solver_bob();
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 100);
+    owner_deposit(&mut contract, &mut context, &user_bob(), "ETH", 100);
 
-    owner_deposit(&mut contract, &mut context, &alice, "SOL", 100);
-    owner_deposit(&mut contract, &mut context, &bob, "ETH", 100);
-
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id_a = contract.make_intent("SOL".to_string(), u(100), "ETH".to_string(), u(100));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id_b = contract.make_intent("ETH".to_string(), u(100), "SOL".to_string(), u(100));
+    let id_a = make(&mut contract, &mut context, &user_alice(), "SUI", 100, "ETH", 100, "a");
+    let id_b = make(&mut contract, &mut context, &user_bob(), "ETH", 100, "SUI", 100, "b");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
@@ -610,12 +452,10 @@ fn test_mpc_sign_failure_rollback_to_taken() {
     let sub_a = u(2);
     assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Verifying);
 
-    // MPC sign FAILS
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    let res = contract.on_signed(2, ChainType::ETH, [1u8; 32], Err(near_sdk::PromiseError::Failed));
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    let res = contract.on_signed(2, "ETH".to_string(), "ECDSA".to_string(), [1u8; 32], Err(near_sdk::PromiseError::Failed));
     assert_eq!(res, "Failed");
 
-    // Rolled back to Taken (can retry)
     assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Taken);
     assert!(contract.get_transition_expectation(sub_a).is_none());
 }
@@ -623,18 +463,12 @@ fn test_mpc_sign_failure_rollback_to_taken() {
 #[test]
 fn test_retry_settlement_after_failure() {
     let (mut contract, mut context) = new_contract();
-    let alice = user_alice();
-    let bob = solver_bob();
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 100);
+    owner_deposit(&mut contract, &mut context, &user_bob(), "ETH", 100);
 
-    owner_deposit(&mut contract, &mut context, &alice, "SOL", 100);
-    owner_deposit(&mut contract, &mut context, &bob, "ETH", 100);
+    let id_a = make(&mut contract, &mut context, &user_alice(), "SUI", 100, "ETH", 100, "a");
+    let id_b = make(&mut contract, &mut context, &user_bob(), "ETH", 100, "SUI", 100, "b");
 
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id_a = contract.make_intent("SOL".to_string(), u(100), "ETH".to_string(), u(100));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id_b = contract.make_intent("ETH".to_string(), u(100), "SOL".to_string(), u(100));
-
-    // batch_match is called by owner (or solver in production)
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
         .attached_deposit(NearToken::from_near(1))
@@ -642,43 +476,36 @@ fn test_retry_settlement_after_failure() {
     );
     let _ = contract.batch_match_intents(vec![mp(id_a, 100, 100), mp(id_b, 100, 100)]);
 
-    let sub_a = u(2);
-
     // MPC sign fails
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(2, ChainType::ETH, [1u8; 32], Err(near_sdk::PromiseError::Failed));
-    assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Taken);
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_signed(2, "ETH".to_string(), "ECDSA".to_string(), [1u8; 32], Err(near_sdk::PromiseError::Failed));
+    assert_eq!(contract.get_sub_intent(u(2)).unwrap().status, IntentStatus::Taken);
 
-    // Retry — taker is orderbook_contract() (set as solver during batch_match)
+    // Retry
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
         .attached_deposit(NearToken::from_near(1))
-        .prepaid_gas(Gas::from_tgas(300))
+        .prepaid_gas(Gas::from_tgas(3000))
         .build()
     );
-    let _ = contract.retry_settlement(sub_a, [2u8; 32], "sol/1".to_string(), ChainType::SOL);
-    assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Verifying);
+    let _ = contract.retry_settlement(u(2), [2u8; 32], "sui/1".to_string(), "SUI".to_string(), "EDDSA".to_string(), Some(vec![99u8; 64]));
+    assert_eq!(contract.get_sub_intent(u(2)).unwrap().status, IntentStatus::Verifying);
 
     // MPC sign succeeds this time
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(2, ChainType::SOL, [2u8; 32], Ok(mock_sig()));
-    assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Settled);
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_signed(2, "SUI".to_string(), "EDDSA".to_string(), [2u8; 32], Ok(mock_eddsa_sig()));
+    assert_eq!(contract.get_sub_intent(u(2)).unwrap().status, IntentStatus::Settled);
 }
 
 #[test]
-#[should_panic(expected = "Only the solver who matched can retry")]
+#[should_panic(expected = "Only the original matcher can retry")]
 fn test_retry_settlement_wrong_caller() {
     let (mut contract, mut context) = new_contract();
-    let alice = user_alice();
-    let bob = solver_bob();
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 100);
+    owner_deposit(&mut contract, &mut context, &user_bob(), "ETH", 100);
 
-    owner_deposit(&mut contract, &mut context, &alice, "SOL", 100);
-    owner_deposit(&mut contract, &mut context, &bob, "ETH", 100);
-
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id_a = contract.make_intent("SOL".to_string(), u(100), "ETH".to_string(), u(100));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id_b = contract.make_intent("ETH".to_string(), u(100), "SOL".to_string(), u(100));
+    let id_a = make(&mut contract, &mut context, &user_alice(), "SUI", 100, "ETH", 100, "a");
+    let id_b = make(&mut contract, &mut context, &user_bob(), "ETH", 100, "SUI", 100, "b");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
@@ -687,36 +514,30 @@ fn test_retry_settlement_wrong_caller() {
     );
     let _ = contract.batch_match_intents(vec![mp(id_a, 100, 100), mp(id_b, 100, 100)]);
 
-    // MPC fails
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(2, ChainType::ETH, [1u8; 32], Err(near_sdk::PromiseError::Failed));
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_signed(2, "ETH".to_string(), "ECDSA".to_string(), [1u8; 32], Err(near_sdk::PromiseError::Failed));
 
-    // Alice (not the solver) tries to retry — should fail
+    // Alice (not the original matcher) tries to retry
     testing_env!(context
-        .predecessor_account_id(alice)
+        .predecessor_account_id(user_alice())
         .attached_deposit(NearToken::from_near(1))
         .build()
     );
-    let _ = contract.retry_settlement(u(2), [2u8; 32], "sol/1".to_string(), ChainType::SOL);
+    let _ = contract.retry_settlement(u(2), [2u8; 32], "sui/1".to_string(), "SUI".to_string(), "EDDSA".to_string(), Some(vec![99u8; 64]));
 }
 
 // ============================================================================
-// 7. TRANSITION VERIFY FAILURE
+// 6. TRANSITION VERIFY FAILURE
 // ============================================================================
 
 #[test]
 fn test_transition_verify_failure_rollback() {
     let (mut contract, mut context) = new_contract();
-    let alice = user_alice();
-    let bob = solver_bob();
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 100);
+    owner_deposit(&mut contract, &mut context, &user_bob(), "ETH", 100);
 
-    owner_deposit(&mut contract, &mut context, &alice, "SOL", 100);
-    owner_deposit(&mut contract, &mut context, &bob, "ETH", 100);
-
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id_a = contract.make_intent("SOL".to_string(), u(100), "ETH".to_string(), u(100));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id_b = contract.make_intent("ETH".to_string(), u(100), "SOL".to_string(), u(100));
+    let id_a = make(&mut contract, &mut context, &user_alice(), "SUI", 100, "ETH", 100, "a");
+    let id_b = make(&mut contract, &mut context, &user_bob(), "ETH", 100, "SUI", 100, "b");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
@@ -727,24 +548,21 @@ fn test_transition_verify_failure_rollback() {
 
     let sub_a = u(2);
 
-    // MPC sign succeeds
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(2, ChainType::ETH, [1u8; 32], Ok(mock_sig()));
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_signed(2, "ETH".to_string(), "ECDSA".to_string(), [1u8; 32], Ok(mock_ecdsa_sig()));
     assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Settled);
 
-    // Transition verify
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
     let _ = contract.verify_transition_completion(sub_a, vec![1], "addr".to_string(), "tx".to_string());
 
-    // Transition verify FAILS
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
     let res = contract.on_transition_verified(sub_a, "tx".to_string(), Ok(false));
     assert_eq!(res, "TransitionVerifyFailed");
-    assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Settled); // Can retry
+    assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Settled);
 }
 
 // ============================================================================
-// 8. WITHDRAW TESTS (with refund on failure)
+// 7. WITHDRAW TESTS (from internal balance)
 // ============================================================================
 
 #[test]
@@ -757,7 +575,7 @@ fn test_withdraw_deducts_balance() {
         .attached_deposit(NearToken::from_near(1))
         .build()
     );
-    let _ = contract.withdraw("ETH".to_string(), u(1000), [9u8; 32], "eth/alice".to_string(), ChainType::ETH);
+    let _ = contract.withdraw("ETH".to_string(), u(1000), [9u8; 32], "eth/alice".to_string(), "ETH".to_string(), "ECDSA".to_string(), None);
     assert_eq!(contract.get_balance(user_alice(), "ETH".to_string()), u(9000));
 }
 
@@ -771,7 +589,7 @@ fn test_withdraw_insufficient_balance() {
         .attached_deposit(NearToken::from_near(1))
         .build()
     );
-    let _ = contract.withdraw("ETH".to_string(), u(200), [0u8; 32], "eth/a".to_string(), ChainType::ETH);
+    let _ = contract.withdraw("ETH".to_string(), u(200), [0u8; 32], "eth/a".to_string(), "ETH".to_string(), "ECDSA".to_string(), None);
 }
 
 #[test]
@@ -784,19 +602,16 @@ fn test_withdraw_mpc_success_cleans_up() {
         .attached_deposit(NearToken::from_near(1))
         .build()
     );
-    let _ = contract.withdraw("ETH".to_string(), u(50), [9u8; 32], "eth/a".to_string(), ChainType::ETH);
+    let _ = contract.withdraw("ETH".to_string(), u(50), [9u8; 32], "eth/a".to_string(), "ETH".to_string(), "ECDSA".to_string(), None);
 
-    // wd_id = next_id - 1. After 0 intents, wd_id = 0
     let wd_id = 0u64;
     assert!(contract.pending_withdrawals.get(&wd_id).is_some());
 
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    let res = contract.on_signed(wd_id, ChainType::ETH, [9u8; 32], Ok(mock_sig()));
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    let res = contract.on_signed(wd_id, "ETH".to_string(), "ECDSA".to_string(), [9u8; 32], Ok(mock_ecdsa_sig()));
     assert_eq!(res, "Success");
 
-    // Pending withdrawal cleaned up
     assert!(contract.pending_withdrawals.get(&wd_id).is_none());
-    // Balance stays deducted
     assert_eq!(contract.get_balance(user_alice(), "ETH".to_string()), u(50));
 }
 
@@ -810,21 +625,111 @@ fn test_withdraw_mpc_failure_refunds() {
         .attached_deposit(NearToken::from_near(1))
         .build()
     );
-    let _ = contract.withdraw("ETH".to_string(), u(50), [9u8; 32], "eth/a".to_string(), ChainType::ETH);
+    let _ = contract.withdraw("ETH".to_string(), u(50), [9u8; 32], "eth/a".to_string(), "ETH".to_string(), "ECDSA".to_string(), None);
 
-    // Balance deducted to 50
     assert_eq!(contract.get_balance(user_alice(), "ETH".to_string()), u(50));
 
-    // MPC sign FAILS
     let wd_id = 0u64;
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    let res = contract.on_signed(wd_id, ChainType::ETH, [9u8; 32], Err(near_sdk::PromiseError::Failed));
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    let res = contract.on_signed(wd_id, "ETH".to_string(), "ECDSA".to_string(), [9u8; 32], Err(near_sdk::PromiseError::Failed));
     assert_eq!(res, "Failed");
 
-    // Balance REFUNDED to 100
     assert_eq!(contract.get_balance(user_alice(), "ETH".to_string()), u(100));
-    // Pending withdrawal cleaned up
     assert!(contract.pending_withdrawals.get(&wd_id).is_none());
+}
+
+// ============================================================================
+// 8. WITHDRAW FROM MPC ADDRESS
+// ============================================================================
+
+#[test]
+fn test_withdraw_from_mpc_basic() {
+    let (mut contract, mut context) = new_contract();
+    let alice = user_alice();
+
+    // Alice calls withdraw_from_mpc — path contains her account ID
+    testing_env!(context
+        .predecessor_account_id(alice.clone())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let _ = contract.withdraw_from_mpc(
+        "ETH".to_string(),
+        "ECDSA".to_string(),
+        format!("eth/{}", alice),
+        [7u8; 32],
+        None,
+    );
+
+    // No internal balance change (withdraw_from_mpc doesn't touch balances)
+    assert_eq!(contract.get_balance(alice, "ETH".to_string()), u(0));
+}
+
+#[test]
+fn test_withdraw_from_mpc_eddsa() {
+    let (mut contract, mut context) = new_contract();
+    let bob = user_bob();
+
+    testing_env!(context
+        .predecessor_account_id(bob.clone())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let _ = contract.withdraw_from_mpc(
+        "SUI".to_string(),
+        "EDDSA".to_string(),
+        format!("sui/{}", bob),
+        [0u8; 32],
+        Some(vec![8u8; 64]),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Derivation path must belong to the caller")]
+fn test_withdraw_from_mpc_wrong_caller_panics() {
+    let (mut contract, mut context) = new_contract();
+
+    // Alice tries to withdraw from Bob's MPC path
+    testing_env!(context
+        .predecessor_account_id(user_alice())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let _ = contract.withdraw_from_mpc(
+        "ETH".to_string(),
+        "ECDSA".to_string(),
+        format!("eth/{}", user_bob()),
+        [0u8; 32],
+        None,
+    );
+}
+
+#[test]
+fn test_withdraw_from_mpc_on_signed_success() {
+    let (mut contract, mut context) = new_contract();
+    let alice = user_alice();
+
+    testing_env!(context
+        .predecessor_account_id(alice.clone())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let _ = contract.withdraw_from_mpc(
+        "ETH".to_string(),
+        "ECDSA".to_string(),
+        format!("eth/{}", alice),
+        [7u8; 32],
+        None,
+    );
+
+    // wd_id = 0 (first ID allocated)
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    let res = contract.on_signed(0, "ETH".to_string(), "ECDSA".to_string(), [7u8; 32], Ok(mock_ecdsa_sig()));
+    assert_eq!(res, "Success");
 }
 
 // ============================================================================
@@ -837,7 +742,7 @@ fn test_get_open_intents_pagination() {
     owner_deposit(&mut contract, &mut context, &user_alice(), "A", 1000);
     testing_env!(context.predecessor_account_id(user_alice()).build());
     for _ in 0..5 {
-        contract.make_intent("A".to_string(), u(10), "B".to_string(), u(10));
+        contract.make_intent("A".to_string(), u(10), "B".to_string(), u(10), 0, "addr".to_string());
     }
     assert_eq!(contract.get_open_intents(u(0), 3).len(), 3);
     assert_eq!(contract.get_open_intents(u(3), 3).len(), 2);
@@ -864,16 +769,14 @@ fn test_get_intent_nonexistent() {
 fn test_multi_round_trading() {
     let (mut contract, mut context) = new_contract();
     let alice = user_alice();
-    let bob = solver_bob();
+    let bob = user_bob();
 
-    owner_deposit(&mut contract, &mut context, &alice, "SOL", 200);
+    owner_deposit(&mut contract, &mut context, &alice, "SUI", 200);
     owner_deposit(&mut contract, &mut context, &bob, "ETH", 200);
 
     // Round 1
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id1 = contract.make_intent("SOL".to_string(), u(100), "ETH".to_string(), u(100));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id2 = contract.make_intent("ETH".to_string(), u(100), "SOL".to_string(), u(100));
+    let id1 = make(&mut contract, &mut context, &alice, "SUI", 100, "ETH", 100, "alice_eth");
+    let id2 = make(&mut contract, &mut context, &bob, "ETH", 100, "SUI", 100, "bob_sui");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
@@ -883,13 +786,11 @@ fn test_multi_round_trading() {
     let _ = contract.batch_match_intents(vec![mp(id1, 100, 100), mp(id2, 100, 100)]);
 
     assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(100));
-    assert_eq!(contract.get_balance(bob.clone(), "SOL".to_string()), u(100));
+    assert_eq!(contract.get_balance(bob.clone(), "SUI".to_string()), u(100));
 
     // Round 2: trade what they got
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id3 = contract.make_intent("ETH".to_string(), u(50), "SOL".to_string(), u(50));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id4 = contract.make_intent("SOL".to_string(), u(50), "ETH".to_string(), u(50));
+    let id3 = make(&mut contract, &mut context, &alice, "ETH", 50, "SUI", 50, "alice_sui");
+    let id4 = make(&mut contract, &mut context, &bob, "SUI", 50, "ETH", 50, "bob_eth");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
@@ -898,7 +799,7 @@ fn test_multi_round_trading() {
     );
     let _ = contract.batch_match_intents(vec![mp(id3, 50, 50), mp(id4, 50, 50)]);
 
-    assert_eq!(contract.get_balance(alice.clone(), "SOL".to_string()), u(150));
+    assert_eq!(contract.get_balance(alice.clone(), "SUI".to_string()), u(150));
     assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(50));
 }
 
@@ -910,23 +811,19 @@ fn test_multi_round_trading() {
 fn test_4party_complex_ring() {
     let (mut contract, mut context) = new_contract();
     let alice = user_alice();
-    let bob = solver_bob();
+    let bob = user_bob();
     let charlie = user_charlie();
     let dave = user_dave();
 
     owner_deposit(&mut contract, &mut context, &alice, "USDC", 100);
     owner_deposit(&mut contract, &mut context, &bob, "BTC", 1);
     owner_deposit(&mut contract, &mut context, &charlie, "ETH", 10);
-    owner_deposit(&mut contract, &mut context, &dave, "SOL", 1000);
+    owner_deposit(&mut contract, &mut context, &dave, "SUI", 1000);
 
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id1 = contract.make_intent("USDC".to_string(), u(100), "BTC".to_string(), u(1));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id2 = contract.make_intent("BTC".to_string(), u(1), "ETH".to_string(), u(10));
-    testing_env!(context.predecessor_account_id(charlie.clone()).build());
-    let id3 = contract.make_intent("ETH".to_string(), u(10), "SOL".to_string(), u(1000));
-    testing_env!(context.predecessor_account_id(dave.clone()).build());
-    let id4 = contract.make_intent("SOL".to_string(), u(1000), "USDC".to_string(), u(100));
+    let id1 = make(&mut contract, &mut context, &alice, "USDC", 100, "BTC", 1, "alice_btc");
+    let id2 = make(&mut contract, &mut context, &bob, "BTC", 1, "ETH", 10, "bob_eth");
+    let id3 = make(&mut contract, &mut context, &charlie, "ETH", 10, "SUI", 1000, "charlie_sui");
+    let id4 = make(&mut contract, &mut context, &dave, "SUI", 1000, "USDC", 100, "dave_usdc");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
@@ -939,30 +836,28 @@ fn test_4party_complex_ring() {
 
     assert_eq!(contract.get_balance(alice, "BTC".to_string()), u(1));
     assert_eq!(contract.get_balance(bob, "ETH".to_string()), u(10));
-    assert_eq!(contract.get_balance(charlie, "SOL".to_string()), u(1000));
+    assert_eq!(contract.get_balance(charlie, "SUI".to_string()), u(1000));
     assert_eq!(contract.get_balance(dave, "USDC".to_string()), u(100));
 }
 
 // ============================================================================
-// 12. END-TO-END WITH WITHDRAW
+// 12. END-TO-END WITH WITHDRAW + WITHDRAW_FROM_MPC
 // ============================================================================
 
 #[test]
-fn test_end_to_end_with_withdraw() {
+fn test_end_to_end_with_withdraw_from_mpc() {
     let (mut contract, mut context) = new_contract();
     let alice = user_alice();
-    let bob = solver_bob();
+    let bob = user_bob();
 
     // Deposit
     testing_env!(context.predecessor_account_id(orderbook_contract()).build());
-    contract.on_mpc_deposit_verified(alice.clone(), "SOL".to_string(), U128(1000), "a".to_string(), format!("mpc:deposit:{}:SOL", alice), Ok(true));
-    contract.on_mpc_deposit_verified(bob.clone(), "ETH".to_string(), U128(500), "b".to_string(), format!("mpc:deposit:{}:ETH", bob), Ok(true));
+    contract.on_mpc_deposit_verified(alice.clone(), "SUI".to_string(), U128(1000), "a".to_string(), format!("mpc:deposit:{}:SUI", alice), "tx-5".to_string(), Ok(true));
+    contract.on_mpc_deposit_verified(bob.clone(), "ETH".to_string(), U128(500), "b".to_string(), format!("mpc:deposit:{}:ETH", bob), "tx-6".to_string(), Ok(true));
 
     // Make & match
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id_a = contract.make_intent("SOL".to_string(), u(1000), "ETH".to_string(), u(500));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id_b = contract.make_intent("ETH".to_string(), u(500), "SOL".to_string(), u(1000));
+    let id_a = make(&mut contract, &mut context, &alice, "SUI", 1000, "ETH", 500, "alice_eth_mpc");
+    let id_b = make(&mut contract, &mut context, &bob, "ETH", 500, "SUI", 1000, "bob_sui_mpc");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
@@ -970,42 +865,63 @@ fn test_end_to_end_with_withdraw() {
         .build()
     );
     let _ = contract.batch_match_intents(vec![
-        mp_with_chain(id_a, 1000, 500, ChainType::SOL),
-        mp_with_chain(id_b, 500, 1000, ChainType::ETH),
+        mp_chain(id_a, 1000, 500, "SUI", "EDDSA"),
+        mp_chain(id_b, 500, 1000, "ETH", "ECDSA"),
     ]);
 
     // MPC sign
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(2, ChainType::SOL, [1u8; 32], Ok(mock_sig()));
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(3, ChainType::ETH, [1u8; 32], Ok(mock_sig()));
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_signed(2, "SUI".to_string(), "EDDSA".to_string(), [1u8; 32], Ok(mock_eddsa_sig()));
+    testing_env!(context.prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_signed(3, "ETH".to_string(), "ECDSA".to_string(), [1u8; 32], Ok(mock_ecdsa_sig()));
 
     // Transition verify
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
     let _ = contract.verify_transition_completion(u(2), vec![1], "a".to_string(), "tx-a".to_string());
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
+    testing_env!(context.prepaid_gas(Gas::from_tgas(3000)).build());
     let _ = contract.verify_transition_completion(u(3), vec![1], "b".to_string(), "tx-b".to_string());
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
     contract.on_transition_verified(u(2), "tx-a".to_string(), Ok(true));
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
+    testing_env!(context.prepaid_gas(Gas::from_tgas(3000)).build());
     contract.on_transition_verified(u(3), "tx-b".to_string(), Ok(true));
 
-    // Alice withdraws ETH
-    assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(500));
+    // ---- Phase: withdraw_from_mpc ----
+    // After settlement, funds are in user's MPC addresses on external chains.
+    // Now users call withdraw_from_mpc to move to personal wallets.
+
+    // Alice: withdraw ETH from her MPC address to her MetaMask
     testing_env!(context
         .predecessor_account_id(alice.clone())
         .attached_deposit(NearToken::from_near(1))
-        .prepaid_gas(Gas::from_tgas(300))
+        .prepaid_gas(Gas::from_tgas(3000))
         .build()
     );
-    let _ = contract.withdraw("ETH".to_string(), u(500), [5u8; 32], "eth/a".to_string(), ChainType::ETH);
-    assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(0));
+    let _ = contract.withdraw_from_mpc(
+        "ETH".to_string(), "ECDSA".to_string(),
+        format!("eth/{}", alice), [10u8; 32], None,
+    );
 
-    // MPC sign for withdraw succeeds
-    // wd_id = 4 (next_id after 0,1,2,3 used by intents+sub_intents)
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(4, ChainType::ETH, [5u8; 32], Ok(mock_sig()));
-    assert_eq!(contract.get_balance(alice, "ETH".to_string()), u(0));
+    // MPC sign for withdraw_from_mpc succeeds (wd_id = 4)
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    let res = contract.on_signed(4, "ETH".to_string(), "ECDSA".to_string(), [10u8; 32], Ok(mock_ecdsa_sig()));
+    assert_eq!(res, "Success");
+
+    // Bob: withdraw SUI from his MPC address to his Sui Wallet
+    testing_env!(context
+        .predecessor_account_id(bob.clone())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let _ = contract.withdraw_from_mpc(
+        "SUI".to_string(), "EDDSA".to_string(),
+        format!("sui/{}", bob), [0u8; 32], Some(vec![11u8; 64]),
+    );
+
+    // MPC sign succeeds (wd_id = 5)
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    let res = contract.on_signed(5, "SUI".to_string(), "EDDSA".to_string(), [0u8; 32], Ok(mock_eddsa_sig()));
+    assert_eq!(res, "Success");
 }
 
 // ============================================================================
@@ -1019,75 +935,14 @@ fn test_id_monotonic_increment() {
     testing_env!(context.predecessor_account_id(user_alice()).build());
     let mut last_id = 0u128;
     for i in 0..10 {
-        let id = contract.make_intent("A".to_string(), u(1), "B".to_string(), u(1));
+        let id = contract.make_intent("A".to_string(), u(1), "B".to_string(), u(1), 0, "addr".to_string());
         if i > 0 { assert!(id.0 > last_id); }
         last_id = id.0;
     }
 }
 
 // ============================================================================
-// 14. SUBMIT PAYMENT PROOF (ZK path)
-// ============================================================================
-
-#[test]
-fn test_submit_payment_proof_memo_check() {
-    let (mut contract, mut context) = new_contract();
-    let alice = user_alice();
-    let bob = solver_bob();
-
-    owner_deposit(&mut contract, &mut context, &alice, "SOL", 1000);
-    owner_deposit(&mut contract, &mut context, &bob, "ETH", 500);
-
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id_a = contract.make_intent("SOL".to_string(), u(1000), "ETH".to_string(), u(500));
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let _id_b = contract.make_intent("ETH".to_string(), u(500), "SOL".to_string(), u(1000));
-
-    // Use take_intent to create a sub-intent in Taken state (for submit_payment_proof)
-    testing_env!(context.predecessor_account_id(solver_bob()).build());
-    let sub_a = contract.take_intent(id_a, u(1000));
-
-    testing_env!(context
-        .predecessor_account_id(solver_bob())
-        .attached_deposit(NearToken::from_near(1))
-        .build()
-    );
-    let _ = contract.submit_payment_proof(
-        sub_a, vec![1, 2, 3], [0u8; 32],
-        "sol/transfer".to_string(), ChainType::ETH, ChainType::SOL,
-        "recipient-addr".to_string(),
-        format!("sub:{}", sub_a.0),
-    );
-    assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Verifying);
-}
-
-#[test]
-#[should_panic(expected = "memo mismatch")]
-fn test_submit_payment_proof_wrong_memo() {
-    let (mut contract, mut context) = new_contract();
-    owner_deposit(&mut contract, &mut context, &user_alice(), "SOL", 100);
-    owner_deposit(&mut contract, &mut context, &solver_bob(), "ETH", 100);
-
-    testing_env!(context.predecessor_account_id(user_alice()).build());
-    let id_a = contract.make_intent("SOL".to_string(), u(100), "ETH".to_string(), u(100));
-
-    testing_env!(context.predecessor_account_id(solver_bob()).build());
-    let sub_a = contract.take_intent(id_a, u(100));
-
-    testing_env!(context
-        .predecessor_account_id(solver_bob())
-        .attached_deposit(NearToken::from_near(1))
-        .build()
-    );
-    let _ = contract.submit_payment_proof(
-        sub_a, vec![1], [0u8; 32],
-        "sol/transfer".to_string(), ChainType::ETH, ChainType::SOL,
-        "recipient".to_string(), "wrong_memo".to_string(),
-    );
-}
-
-// ============================================================================
-// 15. VERIFY_MPC_DEPOSIT MEMO FORMAT
+// 14. VERIFY_MPC_DEPOSIT MEMO FORMAT
 // ============================================================================
 
 #[test]
@@ -1100,726 +955,751 @@ fn test_verify_mpc_deposit_wrong_memo() {
         .build()
     );
     let _ = contract.verify_mpc_deposit(
-        user_alice(), ChainType::ETH, "ETH".to_string(),
+        user_alice(), "ETH".to_string(), "ETH".to_string(),
         U128(100), "recipient".to_string(), "bad_memo".to_string(), vec![1],
+        "tx-hash".to_string(),
     );
 }
 
 // ============================================================================
-// 16. Complete end-to-end simulation: full cross-chain trading flow
-//     Scenario: Alice swaps SOL for ETH, Bob swaps ETH for SOL, Charlie swaps SOL for ETH
-//     Covers: deposit -> place order -> match -> MPC sign (incl. retry on failure) -> transition verify -> withdraw (incl. refund on failure)
+// 15. CANCEL INTENT
 // ============================================================================
 
 #[test]
-fn test_complete_e2e_simulation() {
+fn test_cancel_intent_basic() {
+    let (mut contract, mut context) = new_contract();
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 1000);
+
+    let id = make(&mut contract, &mut context, &user_alice(), "SUI", 1000, "ETH", 500, "addr");
+    assert_eq!(contract.get_balance(user_alice(), "SUI".to_string()), u(0));
+
+    testing_env!(context.predecessor_account_id(user_alice()).build());
+    contract.cancel_intent(id);
+
+    let intent = contract.get_intent(id).unwrap();
+    assert_eq!(intent.status, IntentStatus::Cancelled);
+    assert_eq!(contract.get_balance(user_alice(), "SUI".to_string()), u(1000));
+}
+
+#[test]
+fn test_cancel_intent_partial_filled_refunds_remainder() {
     let (mut contract, mut context) = new_contract();
     let alice = user_alice();
-    let bob = solver_bob();
-    let charlie = user_charlie();
+    let bob = user_bob();
 
-    // ================================================================
-    // Phase 1: Deposit
-    //   Simulates user transferring to MPC custody address on external chain (SOL/ETH),
-    //   then balance credited to contract via Light Client proof verification.
-    // ================================================================
-    println!("=== Phase 1: Deposit ===");
+    owner_deposit(&mut contract, &mut context, &alice, "A", 100);
+    owner_deposit(&mut contract, &mut context, &bob, "B", 100);
 
-    // Alice deposits 2000 SOL (via MPC deposit verification)
-    testing_env!(context.predecessor_account_id(orderbook_contract()).build());
-    let result = contract.on_mpc_deposit_verified(
-        alice.clone(),
-        "SOL".to_string(),
-        U128(2_000_000_000),  // 2 SOL (in lamports)
-        "mpc-sol-address-alice".to_string(),
-        format!("mpc:deposit:{}:SOL", alice),
-        Ok(true),
-    );
-    assert_eq!(result, "MpcDepositCredited");
-    assert_eq!(
-        contract.get_balance(alice.clone(), "SOL".to_string()),
-        u(2_000_000_000)
-    );
+    let id_a = make(&mut contract, &mut context, &alice, "A", 100, "B", 100, "a_addr");
+    let id_b = make(&mut contract, &mut context, &bob, "B", 30, "A", 30, "b_addr");
 
-    // Bob deposits 100 ETH (via MPC deposit verification)
-    let result = contract.on_mpc_deposit_verified(
-        bob.clone(),
-        "ETH".to_string(),
-        U128(100_000_000_000_000_000), // 0.1 ETH (in wei)
-        "mpc-eth-address-bob".to_string(),
-        format!("mpc:deposit:{}:ETH", bob),
-        Ok(true),
-    );
-    assert_eq!(result, "MpcDepositCredited");
-    assert_eq!(
-        contract.get_balance(bob.clone(), "ETH".to_string()),
-        u(100_000_000_000_000_000)
-    );
+    testing_env!(context.predecessor_account_id(orderbook_contract()).attached_deposit(NearToken::from_near(1)).build());
+    let _ = contract.batch_match_intents(vec![mp(id_a, 30, 30), mp(id_b, 30, 30)]);
 
-    // Charlie deposits 3000 SOL (via admin direct deposit, for testing)
-    owner_deposit(&mut contract, &mut context, &charlie, "SOL", 3_000_000_000);
-    assert_eq!(
-        contract.get_balance(charlie.clone(), "SOL".to_string()),
-        u(3_000_000_000)
-    );
-
-    // Verify: invalid MPC deposit proof should be rejected
-    testing_env!(context.predecessor_account_id(orderbook_contract()).build());
-    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        contract.on_mpc_deposit_verified(
-            alice.clone(),
-            "SOL".to_string(),
-            U128(999),
-            "addr".to_string(),
-            format!("mpc:deposit:{}:SOL", alice),
-            Ok(false), // verification failed
-        );
-    }));
-    assert!(rejected.is_err(), "Invalid proof should be rejected");
-
-    // ================================================================
-    // Phase 2: Create exchange intent (Make Intent)
-    //   User places order with deposited balance, specifying assets to sell and buy.
-    //   Funds are frozen (deducted) from balance when placing order.
-    // ================================================================
-    println!("=== Phase 2: Create exchange intent ===");
-
-    // Alice: sell 1 SOL, buy 0.05 ETH
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let intent_alice = contract.make_intent(
-        "SOL".to_string(),
-        u(1_000_000_000),                // 1 SOL
-        "ETH".to_string(),
-        u(50_000_000_000_000_000),       // 0.05 ETH
-    );
-    // Alice's SOL balance should decrease by 1 SOL
-    assert_eq!(
-        contract.get_balance(alice.clone(), "SOL".to_string()),
-        u(1_000_000_000) // remaining 1 SOL
-    );
-    let intent_a = contract.get_intent(intent_alice).unwrap();
+    let intent_a = contract.get_intent(id_a).unwrap();
+    assert_eq!(intent_a.filled_amount, 30);
     assert_eq!(intent_a.status, IntentStatus::Open);
-    assert_eq!(intent_a.maker, alice);
-    assert_eq!(intent_a.filled_amount, 0);
 
-    // Bob: sell 0.05 ETH, buy 1 SOL
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let intent_bob = contract.make_intent(
-        "ETH".to_string(),
-        u(50_000_000_000_000_000),       // 0.05 ETH
-        "SOL".to_string(),
-        u(1_000_000_000),                // 1 SOL
+    testing_env!(context.predecessor_account_id(alice.clone()).build());
+    contract.cancel_intent(id_a);
+
+    assert_eq!(contract.get_intent(id_a).unwrap().status, IntentStatus::Cancelled);
+    assert_eq!(contract.get_balance(alice.clone(), "A".to_string()), u(70));
+    assert_eq!(contract.get_balance(alice.clone(), "B".to_string()), u(30));
+}
+
+#[test]
+#[should_panic(expected = "Only Open intents can be cancelled")]
+fn test_cancel_filled_intent_panics() {
+    let (mut contract, mut context) = new_contract();
+    let alice = user_alice();
+    let bob = user_bob();
+
+    owner_deposit(&mut contract, &mut context, &alice, "A", 100);
+    owner_deposit(&mut contract, &mut context, &bob, "B", 100);
+
+    let id_a = make(&mut contract, &mut context, &alice, "A", 100, "B", 100, "a");
+    let id_b = make(&mut contract, &mut context, &bob, "B", 100, "A", 100, "b");
+
+    testing_env!(context.predecessor_account_id(orderbook_contract()).attached_deposit(NearToken::from_near(1)).build());
+    let _ = contract.batch_match_intents(vec![mp(id_a, 100, 100), mp(id_b, 100, 100)]);
+
+    testing_env!(context.predecessor_account_id(alice).build());
+    contract.cancel_intent(id_a);
+}
+
+#[test]
+#[should_panic(expected = "Only maker can cancel")]
+fn test_cancel_intent_wrong_caller_panics() {
+    let (mut contract, mut context) = new_contract();
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 100);
+
+    let id = make(&mut contract, &mut context, &user_alice(), "SUI", 100, "ETH", 50, "addr");
+
+    testing_env!(context.predecessor_account_id(user_bob()).build());
+    contract.cancel_intent(id);
+}
+
+// ============================================================================
+// 16. DEPOSIT REPLAY PROTECTION
+// ============================================================================
+
+#[test]
+fn test_deposit_replay_protection() {
+    let (mut contract, mut context) = new_contract();
+    testing_env!(context.predecessor_account_id(orderbook_contract()).build());
+
+    let result = contract.on_mpc_deposit_verified(
+        user_alice(), "ETH".to_string(), U128(100),
+        "addr".to_string(), format!("mpc:deposit:{}:ETH", user_alice()),
+        "tx-unique-1".to_string(), Ok(true),
     );
-    assert_eq!(
-        contract.get_balance(bob.clone(), "ETH".to_string()),
-        u(50_000_000_000_000_000) // remaining 0.05 ETH
+    assert_eq!(result, "MpcDepositCredited");
+    assert!(contract.verified_deposits.contains(&"tx-unique-1".to_string()));
+}
+
+#[test]
+#[should_panic(expected = "Deposit tx_hash already verified (replay)")]
+fn test_deposit_replay_panics() {
+    let (mut contract, mut context) = new_contract();
+    testing_env!(context
+        .predecessor_account_id(user_alice())
+        .attached_deposit(NearToken::from_near(1))
+        .build()
     );
 
-    // Charlie: sell 2 SOL, buy 0.1 ETH (this order has no match yet)
-    testing_env!(context.predecessor_account_id(charlie.clone()).build());
-    let intent_charlie = contract.make_intent(
-        "SOL".to_string(),
-        u(2_000_000_000),                // 2 SOL
-        "ETH".to_string(),
-        u(100_000_000_000_000_000),      // 0.1 ETH — but Bob only has 0.05 ETH left
-    );
-    assert_eq!(
-        contract.get_balance(charlie.clone(), "SOL".to_string()),
-        u(1_000_000_000) // remaining 1 SOL
-    );
+    contract.verified_deposits.insert(&"already-used-tx".to_string());
 
-    // Verify Open Intents list
-    let open_intents = contract.get_open_intents(u(0), 100);
-    assert_eq!(open_intents.len(), 3);
+    let _ = contract.verify_mpc_deposit(
+        user_alice(), "ETH".to_string(), "ETH".to_string(),
+        U128(100), "recipient".to_string(),
+        format!("mpc:deposit:{}:ETH", user_alice()),
+        vec![1], "already-used-tx".to_string(),
+    );
+}
 
-    // ================================================================
-    // Phase 3: Batch match (Batch Match + Auto MPC Sign)
-    //   Solver/Relayer finds mirror matches and submits batch match.
-    //   Contract verifies price and asset conservation, then auto-triggers MPC signing.
-    //
-    //   This round: Alice(SOL->ETH) <=> Bob(ETH->SOL)
-    //   Charlie's order not matched yet (no counterparty)
-    // ================================================================
-    println!("=== Phase 3: Batch match Alice <=> Bob ===");
+// ============================================================================
+// 17. INTENT EXPIRY
+// ============================================================================
+
+#[test]
+fn test_intent_with_expiry_accepted_before_deadline() {
+    let (mut contract, mut context) = new_contract();
+    let alice = user_alice();
+    let bob = user_bob();
+
+    owner_deposit(&mut contract, &mut context, &alice, "A", 100);
+    owner_deposit(&mut contract, &mut context, &bob, "B", 100);
+
+    let future_ts = env::block_timestamp() + 1_000_000_000;
+
+    testing_env!(context.predecessor_account_id(alice.clone()).build());
+    let id_a = contract.make_intent("A".to_string(), u(100), "B".to_string(), u(100), future_ts, "a_addr".to_string());
+    let id_b = make(&mut contract, &mut context, &bob, "B", 100, "A", 100, "b_addr");
+
+    testing_env!(context.predecessor_account_id(orderbook_contract()).attached_deposit(NearToken::from_near(1)).build());
+    let _ = contract.batch_match_intents(vec![mp(id_a, 100, 100), mp(id_b, 100, 100)]);
+
+    assert_eq!(contract.get_intent(id_a).unwrap().status, IntentStatus::Filled);
+}
+
+#[test]
+#[should_panic(expected = "Intent 0 has expired")]
+fn test_intent_expired_panics_on_match() {
+    let (mut contract, mut context) = new_contract();
+    let alice = user_alice();
+    let bob = user_bob();
+
+    owner_deposit(&mut contract, &mut context, &alice, "A", 100);
+    owner_deposit(&mut contract, &mut context, &bob, "B", 100);
+
+    testing_env!(context.predecessor_account_id(alice.clone()).build());
+    let id_a = contract.make_intent("A".to_string(), u(100), "B".to_string(), u(100), 100, "a".to_string());
+    let id_b = make(&mut contract, &mut context, &bob, "B", 100, "A", 100, "b");
 
     testing_env!(context
         .predecessor_account_id(orderbook_contract())
         .attached_deposit(NearToken::from_near(1))
-        .prepaid_gas(Gas::from_tgas(300))
+        .block_timestamp(200)
         .build()
     );
-    let _ = contract.batch_match_intents(vec![
-        mp_with_chain(intent_alice, 1_000_000_000, 50_000_000_000_000_000, ChainType::SOL),
-        mp_with_chain(intent_bob, 50_000_000_000_000_000, 1_000_000_000, ChainType::ETH),
-    ]);
+    let _ = contract.batch_match_intents(vec![mp(id_a, 100, 100), mp(id_b, 100, 100)]);
+}
 
-    // Verify: Alice gets 0.05 ETH, Bob gets 1 SOL (logical balance)
-    assert_eq!(
-        contract.get_balance(alice.clone(), "ETH".to_string()),
-        u(50_000_000_000_000_000)
-    );
-    assert_eq!(
-        contract.get_balance(bob.clone(), "SOL".to_string()),
-        u(1_000_000_000)
-    );
+#[test]
+fn test_intent_no_expiry_always_valid() {
+    let (mut contract, mut context) = new_contract();
+    let alice = user_alice();
+    let bob = user_bob();
 
-    // Verify: Intent status becomes Filled
-    assert_eq!(
-        contract.get_intent(intent_alice).unwrap().status,
-        IntentStatus::Filled
-    );
-    assert_eq!(
-        contract.get_intent(intent_bob).unwrap().status,
-        IntentStatus::Filled
-    );
+    owner_deposit(&mut contract, &mut context, &alice, "A", 100);
+    owner_deposit(&mut contract, &mut context, &bob, "B", 100);
 
-    // Verify: SubIntent created and in Verifying status (MPC sign triggered)
-    // intent_alice=0, intent_bob=1, intent_charlie=2 → sub_alice=3, sub_bob=4
-    let sub_alice = u(3);
-    let sub_bob = u(4);
-    assert_eq!(
-        contract.get_sub_intent(sub_alice).unwrap().status,
-        IntentStatus::Verifying
-    );
-    assert_eq!(
-        contract.get_sub_intent(sub_bob).unwrap().status,
-        IntentStatus::Verifying
-    );
+    let id_a = make(&mut contract, &mut context, &alice, "A", 100, "B", 100, "a");
+    let id_b = make(&mut contract, &mut context, &bob, "B", 100, "A", 100, "b");
 
-    // Verify: TransitionExpectation recorded
-    let exp_alice = contract.get_transition_expectation(sub_alice).unwrap();
-    assert_eq!(exp_alice.chain_type, ChainType::SOL);
-    assert_eq!(exp_alice.expected_amount, 1_000_000_000);
+    testing_env!(context.predecessor_account_id(orderbook_contract()).attached_deposit(NearToken::from_near(1)).build());
+    let _ = contract.batch_match_intents(vec![mp(id_a, 100, 100), mp(id_b, 100, 100)]);
+    assert_eq!(contract.get_intent(id_a).unwrap().status, IntentStatus::Filled);
+}
 
-    let exp_bob = contract.get_transition_expectation(sub_bob).unwrap();
-    assert_eq!(exp_bob.chain_type, ChainType::ETH);
-    assert_eq!(exp_bob.expected_amount, 50_000_000_000_000_000);
+// ============================================================================
+// 18. OPEN INTENT INDEX
+// ============================================================================
 
-    // Verify: Charlie's Intent still Open
-    assert_eq!(
-        contract.get_intent(intent_charlie).unwrap().status,
-        IntentStatus::Open
-    );
+#[test]
+fn test_open_intent_index_tracks_correctly() {
+    let (mut contract, mut context) = new_contract();
+    owner_deposit(&mut contract, &mut context, &user_alice(), "A", 1000);
+    owner_deposit(&mut contract, &mut context, &user_bob(), "B", 1000);
 
-    // Open Intents should only have Charlie's
-    let open_intents = contract.get_open_intents(u(0), 100);
-    assert_eq!(open_intents.len(), 1);
-    assert_eq!(open_intents[0].id, intent_charlie.0 as u64);
+    let id1 = make(&mut contract, &mut context, &user_alice(), "A", 100, "B", 100, "a1");
+    let id2 = make(&mut contract, &mut context, &user_alice(), "A", 200, "B", 200, "a2");
+    let id3 = make(&mut contract, &mut context, &user_alice(), "A", 300, "B", 300, "a3");
 
-    // ================================================================
-    // Phase 4: MPC sign callback
-    //   Simulates MPC network returning sign result.
-    //   Scenario: Alice's sign succeeds, Bob's sign fails (simulating network fault)
-    // ================================================================
-    println!("=== Phase 4: MPC sign callback ===");
+    assert_eq!(contract.get_open_intent_count(), 3);
 
-    // Alice's sub-intent: MPC sign succeeds
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
-    );
-    let sign_result = contract.on_signed(
-        3, // sub_alice id
-        ChainType::SOL,
-        [1u8; 32],
-        Ok(mock_sig()),
-    );
-    assert_eq!(sign_result, "Success");
-    assert_eq!(
-        contract.get_sub_intent(sub_alice).unwrap().status,
-        IntentStatus::Settled
-    );
+    testing_env!(context.predecessor_account_id(user_alice()).build());
+    contract.cancel_intent(id2);
+    assert_eq!(contract.get_open_intent_count(), 2);
 
-    // Bob's sub-intent: MPC sign fails
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    let sign_result = contract.on_signed(
-        4, // sub_bob id
-        ChainType::ETH,
-        [1u8; 32],
-        Err(near_sdk::PromiseError::Failed), // sign failed
-    );
-    assert_eq!(sign_result, "Failed");
+    let id4 = make(&mut contract, &mut context, &user_bob(), "B", 100, "A", 100, "b1");
 
-    // Verify: Bob's sub-intent rolled back to Taken status, can retry
-    assert_eq!(
-        contract.get_sub_intent(sub_bob).unwrap().status,
-        IntentStatus::Taken
-    );
-    // TransitionExpectation cleared
-    assert!(contract.get_transition_expectation(sub_bob).is_none());
+    testing_env!(context.predecessor_account_id(orderbook_contract()).attached_deposit(NearToken::from_near(1)).build());
+    let _ = contract.batch_match_intents(vec![mp(id1, 100, 100), mp(id4, 100, 100)]);
 
-    // ================================================================
-    // Phase 5: Retry settlement (Retry Settlement)
-    //   After Bob's MPC sign fails, Solver can resubmit sign request.
-    // ================================================================
-    println!("=== Phase 5: Retry Bob's settlement ===");
+    assert_eq!(contract.get_open_intent_count(), 1);
+    let open = contract.get_open_intents(u(0), 100);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].id, id3.0 as u64);
+}
 
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract()) // solver = orderbook_contract (batch_match caller)
-        .attached_deposit(NearToken::from_near(1))
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
-    );
-    let _ = contract.retry_settlement(
-        sub_bob,
-        [2u8; 32],                    // new payload
-        "eth/retry".to_string(),      // new derivation path
-        ChainType::ETH,
-    );
-    assert_eq!(
-        contract.get_sub_intent(sub_bob).unwrap().status,
-        IntentStatus::Verifying
-    );
-    // TransitionExpectation re-recorded
-    assert!(contract.get_transition_expectation(sub_bob).is_some());
+// ============================================================================
+// 19. PAIR INDEX
+// ============================================================================
 
-    // This time MPC sign succeeds
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
-    );
-    let sign_result = contract.on_signed(4, ChainType::ETH, [2u8; 32], Ok(mock_sig()));
-    assert_eq!(sign_result, "Success");
-    assert_eq!(
-        contract.get_sub_intent(sub_bob).unwrap().status,
-        IntentStatus::Settled
-    );
+#[test]
+fn test_pair_index_basic() {
+    let (mut contract, mut context) = new_contract();
+    owner_deposit(&mut contract, &mut context, &user_alice(), "SUI", 1000);
+    owner_deposit(&mut contract, &mut context, &user_alice(), "ETH", 1000);
 
-    // ================================================================
-    // Phase 6: Transition verification (Transition Verification)
-    //   After MPC sign succeeds, Relayer broadcasts tx on external chain.
-    //   After tx confirmed, submits transfer proof to contract for verification.
-    //
-    //   Scenario: Alice's transition verify succeeds once; Bob's first verify fails then retry succeeds
-    // ================================================================
-    println!("=== Phase 6: Transition verification ===");
+    let id1 = make(&mut contract, &mut context, &user_alice(), "SUI", 100, "ETH", 50, "a1");
+    let id2 = make(&mut contract, &mut context, &user_alice(), "SUI", 200, "ETH", 100, "a2");
+    let _id3 = make(&mut contract, &mut context, &user_alice(), "ETH", 100, "SUI", 200, "a3");
 
-    // --- Alice's transition verify: succeeds once ---
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
-    );
-    let _ = contract.verify_transition_completion(
-        sub_alice,
-        vec![1, 2, 3], // proof_data
-        "alice-sol-external-addr".to_string(),
-        "0xabc123_sol_tx_hash".to_string(),
-    );
-    // Status becomes TransitionVerifying
-    assert_eq!(
-        contract.get_sub_intent(sub_alice).unwrap().status,
-        IntentStatus::TransitionVerifying
-    );
+    let sui_eth = contract.get_intents_by_pair("SUI".to_string(), "ETH".to_string());
+    assert_eq!(sui_eth.len(), 2);
+    assert_eq!(sui_eth[0].id, id1.0 as u64);
+    assert_eq!(sui_eth[1].id, id2.0 as u64);
 
-    // Light Client verification success callback
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
-    );
-    let result = contract.on_transition_verified(
-        sub_alice,
-        "0xabc123_sol_tx_hash".to_string(),
-        Ok(true),
-    );
-    assert_eq!(result, "TransitionVerified");
-    assert_eq!(
-        contract.get_sub_intent(sub_alice).unwrap().status,
-        IntentStatus::Completed
-    );
-    // TransitionExpectation cleared
-    assert!(contract.get_transition_expectation(sub_alice).is_none());
+    let eth_sui = contract.get_intents_by_pair("ETH".to_string(), "SUI".to_string());
+    assert_eq!(eth_sui.len(), 1);
 
-    // --- Bob's transition verify: first attempt fails ---
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
-    );
-    let _ = contract.verify_transition_completion(
-        sub_bob,
-        vec![4, 5, 6],
-        "bob-eth-external-addr".to_string(),
-        "0xdef456_eth_tx_hash".to_string(),
-    );
+    let btc_eth = contract.get_intents_by_pair("BTC".to_string(), "ETH".to_string());
+    assert_eq!(btc_eth.len(), 0);
+}
 
-    // Verification failure callback
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
-    );
-    let result = contract.on_transition_verified(
-        sub_bob,
-        "0xdef456_eth_tx_hash".to_string(),
-        Ok(false), // verification failed
-    );
-    assert_eq!(result, "TransitionVerifyFailed");
-    // Roll back to Settled status, can resubmit proof
-    assert_eq!(
-        contract.get_sub_intent(sub_bob).unwrap().status,
-        IntentStatus::Settled
-    );
+// ============================================================================
+// 20. CLEANUP COMPLETED
+// ============================================================================
 
-    // --- Bob's transition verify: second attempt succeeds ---
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
-    );
-    let _ = contract.verify_transition_completion(
-        sub_bob,
-        vec![7, 8, 9], // new proof
-        "bob-eth-external-addr".to_string(),
-        "0xdef456_eth_tx_hash_v2".to_string(),
-    );
+#[test]
+fn test_cleanup_completed_sub_intent() {
+    let (mut contract, mut context) = new_contract();
+    let alice = user_alice();
+    let bob = user_bob();
 
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
-    );
-    let result = contract.on_transition_verified(
-        sub_bob,
-        "0xdef456_eth_tx_hash_v2".to_string(),
-        Ok(true),
-    );
-    assert_eq!(result, "TransitionVerified");
-    assert_eq!(
-        contract.get_sub_intent(sub_bob).unwrap().status,
-        IntentStatus::Completed
-    );
+    owner_deposit(&mut contract, &mut context, &alice, "A", 100);
+    owner_deposit(&mut contract, &mut context, &bob, "B", 100);
 
-    // ================================================================
-    // Phase 7: Withdraw
-    //   After trade completes, user can withdraw logical balance to external chain.
-    //   Scenario: Alice withdraws 0.05 ETH she received; Bob withdraws 1 SOL but gets refund on MPC failure.
-    // ================================================================
-    println!("=== Phase 7: Withdraw ===");
+    let id_a = make(&mut contract, &mut context, &alice, "A", 100, "B", 100, "a");
+    let id_b = make(&mut contract, &mut context, &bob, "B", 100, "A", 100, "b");
 
-    // --- Alice withdraws 0.05 ETH: success flow ---
-    assert_eq!(
-        contract.get_balance(alice.clone(), "ETH".to_string()),
-        u(50_000_000_000_000_000)
-    );
+    testing_env!(context.predecessor_account_id(orderbook_contract()).attached_deposit(NearToken::from_near(1)).build());
+    let _ = contract.batch_match_intents(vec![mp(id_a, 100, 100), mp(id_b, 100, 100)]);
 
+    let sub_a = u(2);
+
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_signed(2, "ETH".to_string(), "ECDSA".to_string(), [1u8; 32], Ok(mock_ecdsa_sig()));
+
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    let _ = contract.verify_transition_completion(sub_a, vec![1], "addr".to_string(), "tx".to_string());
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_transition_verified(sub_a, "tx".to_string(), Ok(true));
+
+    assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Completed);
+
+    contract.cleanup_completed(sub_a);
+    assert!(contract.get_sub_intent(sub_a).is_none());
+}
+
+#[test]
+#[should_panic(expected = "Can only clean up Completed sub-intents")]
+fn test_cleanup_non_completed_panics() {
+    let (mut contract, mut context) = new_contract();
+    let alice = user_alice();
+    let bob = user_bob();
+
+    owner_deposit(&mut contract, &mut context, &alice, "A", 100);
+    owner_deposit(&mut contract, &mut context, &bob, "B", 100);
+
+    let id_a = make(&mut contract, &mut context, &alice, "A", 100, "B", 100, "a");
+    let id_b = make(&mut contract, &mut context, &bob, "B", 100, "A", 100, "b");
+
+    testing_env!(context.predecessor_account_id(orderbook_contract()).attached_deposit(NearToken::from_near(1)).build());
+    let _ = contract.batch_match_intents(vec![mp(id_a, 100, 100), mp(id_b, 100, 100)]);
+
+    contract.cleanup_completed(u(2));
+}
+
+// ============================================================================
+// 21. DST_ADDRESS PRESERVED IN INTENT
+// ============================================================================
+
+#[test]
+fn test_dst_address_stored_correctly() {
+    let (mut contract, mut context) = new_contract();
+    owner_deposit(&mut contract, &mut context, &user_alice(), "ETH", 1000);
+    owner_deposit(&mut contract, &mut context, &user_bob(), "SUI", 1000);
+
+    let id_a = make(&mut contract, &mut context, &user_alice(), "ETH", 500, "SUI", 100, "0xabc_sui_mpc_alice");
+    let id_b = make(&mut contract, &mut context, &user_bob(), "SUI", 100, "ETH", 500, "0xdef_eth_mpc_bob");
+
+    let intent_a = contract.get_intent(id_a).unwrap();
+    assert_eq!(intent_a.dst_address, "0xabc_sui_mpc_alice");
+
+    let intent_b = contract.get_intent(id_b).unwrap();
+    assert_eq!(intent_b.dst_address, "0xdef_eth_mpc_bob");
+}
+
+// ============================================================================
+// 22. DEPOSIT FROM MPC ADDRESS
+// ============================================================================
+
+#[test]
+fn test_deposit_from_mpc_basic() {
+    let (mut contract, mut context) = new_contract();
+    let alice = user_alice();
+
+    assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(0));
+
+    // Alice calls deposit_from_mpc
     testing_env!(context
         .predecessor_account_id(alice.clone())
         .attached_deposit(NearToken::from_near(1))
-        .prepaid_gas(Gas::from_tgas(300))
+        .prepaid_gas(Gas::from_tgas(3000))
         .build()
     );
-    let _ = contract.withdraw(
+    let _ = contract.deposit_from_mpc(
         "ETH".to_string(),
-        u(50_000_000_000_000_000),
-        [10u8; 32],
-        "eth/alice-withdraw".to_string(),
-        ChainType::ETH,
-    );
-    // Balance immediately deducted
-    assert_eq!(
-        contract.get_balance(alice.clone(), "ETH".to_string()),
-        u(0)
+        u(1000),
+        "ETH".to_string(),
+        "ECDSA".to_string(),
+        format!("eth/{}", alice),
+        [5u8; 32],
+        None,
     );
 
-    // MPC sign succeeds -> withdraw complete
-    // wd_id = 5 (IDs 0,1,2=intents, 3,4=sub-intents, 5=withdrawal)
-    let alice_wd_id = 5u64;
-    assert!(contract.pending_withdrawals.get(&alice_wd_id).is_some());
+    // Balance not yet credited (MPC hasn't responded)
+    assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(0));
 
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
+    // MPC sign succeeds → balance credited
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    let res = contract.on_deposit_signed(
+        0, alice.clone(), "ETH".to_string(), u(1000),
+        "ETH".to_string(), "ECDSA".to_string(), [5u8; 32],
+        Ok(mock_ecdsa_sig()),
     );
-    let result = contract.on_signed(alice_wd_id, ChainType::ETH, [10u8; 32], Ok(mock_sig()));
-    assert_eq!(result, "Success");
-    // PendingWithdrawal cleared, balance unchanged (already deducted)
-    assert!(contract.pending_withdrawals.get(&alice_wd_id).is_none());
-    assert_eq!(
-        contract.get_balance(alice.clone(), "ETH".to_string()),
-        u(0)
-    );
+    assert_eq!(res, "DepositSuccess");
+    assert_eq!(contract.get_balance(alice, "ETH".to_string()), u(1000));
+}
 
-    // --- Bob withdraws 1 SOL: auto-refund on MPC failure ---
-    assert_eq!(
-        contract.get_balance(bob.clone(), "SOL".to_string()),
-        u(1_000_000_000)
-    );
+#[test]
+fn test_deposit_from_mpc_eddsa() {
+    let (mut contract, mut context) = new_contract();
+    let bob = user_bob();
 
     testing_env!(context
         .predecessor_account_id(bob.clone())
         .attached_deposit(NearToken::from_near(1))
-        .prepaid_gas(Gas::from_tgas(300))
+        .prepaid_gas(Gas::from_tgas(3000))
         .build()
     );
-    let _ = contract.withdraw(
-        "SOL".to_string(),
-        u(1_000_000_000),
-        [11u8; 32],
-        "sol/bob-withdraw".to_string(),
-        ChainType::SOL,
-    );
-    // Balance immediately deducted
-    assert_eq!(
-        contract.get_balance(bob.clone(), "SOL".to_string()),
-        u(0)
+    let _ = contract.deposit_from_mpc(
+        "SUI".to_string(),
+        u(5000),
+        "SUI".to_string(),
+        "EDDSA".to_string(),
+        format!("sui/{}", bob),
+        [0u8; 32],
+        Some(vec![6u8; 64]),
     );
 
-    // MPC sign fails -> auto refund
-    let bob_wd_id = 6u64;
+    // MPC sign succeeds (EdDSA)
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    let res = contract.on_deposit_signed(
+        0, bob.clone(), "SUI".to_string(), u(5000),
+        "SUI".to_string(), "EDDSA".to_string(), [0u8; 32],
+        Ok(mock_eddsa_sig()),
+    );
+    assert_eq!(res, "DepositSuccess");
+    assert_eq!(contract.get_balance(bob, "SUI".to_string()), u(5000));
+}
+
+#[test]
+fn test_deposit_from_mpc_failure_no_credit() {
+    let (mut contract, mut context) = new_contract();
+    let alice = user_alice();
+
     testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .prepaid_gas(Gas::from_tgas(300))
+        .predecessor_account_id(alice.clone())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
         .build()
     );
-    let result = contract.on_signed(
-        bob_wd_id,
-        ChainType::SOL,
-        [11u8; 32],
+    let _ = contract.deposit_from_mpc(
+        "ETH".to_string(), u(1000), "ETH".to_string(), "ECDSA".to_string(),
+        format!("eth/{}", alice), [5u8; 32], None,
+    );
+
+    // MPC sign fails → balance NOT credited
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    let res = contract.on_deposit_signed(
+        0, alice.clone(), "ETH".to_string(), u(1000),
+        "ETH".to_string(), "ECDSA".to_string(), [5u8; 32],
         Err(near_sdk::PromiseError::Failed),
     );
-    assert_eq!(result, "Failed");
-    // Balance refunded
-    assert_eq!(
-        contract.get_balance(bob.clone(), "SOL".to_string()),
-        u(1_000_000_000)
-    );
-    assert!(contract.pending_withdrawals.get(&bob_wd_id).is_none());
-
-    // Bob retries withdraw, this time succeeds
-    testing_env!(context
-        .predecessor_account_id(bob.clone())
-        .attached_deposit(NearToken::from_near(1))
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
-    );
-    let _ = contract.withdraw(
-        "SOL".to_string(),
-        u(1_000_000_000),
-        [12u8; 32],
-        "sol/bob-withdraw-retry".to_string(),
-        ChainType::SOL,
-    );
-
-    let bob_wd_id_2 = 7u64;
-    testing_env!(context
-        .predecessor_account_id(orderbook_contract())
-        .prepaid_gas(Gas::from_tgas(300))
-        .build()
-    );
-    let result = contract.on_signed(bob_wd_id_2, ChainType::SOL, [12u8; 32], Ok(mock_sig()));
-    assert_eq!(result, "Success");
-    assert_eq!(
-        contract.get_balance(bob.clone(), "SOL".to_string()),
-        u(0)
-    );
-
-    // ================================================================
-    // Phase 8: Final state verification
-    //   Confirm all data consistent: balances settled, Intent/SubIntent status correct.
-    // ================================================================
-    println!("=== Phase 8: Final state verification ===");
-
-    // Alice: SOL remaining 1 SOL (started 2 SOL, 1 SOL frozen in order), ETH fully withdrawn
-    assert_eq!(
-        contract.get_balance(alice.clone(), "SOL".to_string()),
-        u(1_000_000_000)
-    );
-    assert_eq!(
-        contract.get_balance(alice.clone(), "ETH".to_string()),
-        u(0)
-    );
-
-    // Bob: ETH remaining 0.05 ETH (started 0.1 ETH, 0.05 ETH frozen in order), SOL fully withdrawn
-    assert_eq!(
-        contract.get_balance(bob.clone(), "ETH".to_string()),
-        u(50_000_000_000_000_000)
-    );
-    assert_eq!(
-        contract.get_balance(bob.clone(), "SOL".to_string()),
-        u(0)
-    );
-
-    // Charlie: order still Open, SOL partially frozen
-    assert_eq!(
-        contract.get_intent(intent_charlie).unwrap().status,
-        IntentStatus::Open
-    );
-    assert_eq!(
-        contract.get_balance(charlie.clone(), "SOL".to_string()),
-        u(1_000_000_000) // 3 SOL - 2 SOL (frozen in order) = 1 SOL
-    );
-
-    // All SubIntents Completed
-    assert_eq!(
-        contract.get_sub_intent(sub_alice).unwrap().status,
-        IntentStatus::Completed
-    );
-    assert_eq!(
-        contract.get_sub_intent(sub_bob).unwrap().status,
-        IntentStatus::Completed
-    );
-
-    // No leftover TransitionExpectation
-    assert!(contract.get_transition_expectation(sub_alice).is_none());
-    assert!(contract.get_transition_expectation(sub_bob).is_none());
-
-    // No leftover PendingWithdrawal
-    assert!(contract.pending_withdrawals.get(&alice_wd_id).is_none());
-    assert!(contract.pending_withdrawals.get(&bob_wd_id).is_none());
-    assert!(contract.pending_withdrawals.get(&bob_wd_id_2).is_none());
-
-    println!("=== Complete end-to-end simulation test passed! ===");
+    assert_eq!(res, "DepositFailed");
+    assert_eq!(contract.get_balance(alice, "ETH".to_string()), u(0));
 }
 
-// ============================================================================
-// 17. 3-party ring match + full flow test
-//     Scenario: Alice(BTC->ETH), Bob(ETH->SOL), Charlie(SOL->BTC)
-//     Forms BTC -> ETH -> SOL -> BTC ring trade
-// ============================================================================
-
 #[test]
-fn test_complete_3party_ring_e2e() {
+#[should_panic(expected = "Derivation path must belong to the caller")]
+fn test_deposit_from_mpc_wrong_caller_panics() {
     let (mut contract, mut context) = new_contract();
-    let alice = user_alice();
-    let bob = solver_bob();
-    let charlie = user_charlie();
 
-    // --- Deposits ---
-    testing_env!(context.predecessor_account_id(orderbook_contract()).build());
-    contract.on_mpc_deposit_verified(
-        alice.clone(), "BTC".to_string(), U128(100_000_000), // 1 BTC in satoshis
-        "mpc-btc-alice".to_string(),
-        format!("mpc:deposit:{}:BTC", alice),
-        Ok(true),
-    );
-    contract.on_mpc_deposit_verified(
-        bob.clone(), "ETH".to_string(), U128(10_000_000_000_000_000_000), // 10 ETH in wei
-        "mpc-eth-bob".to_string(),
-        format!("mpc:deposit:{}:ETH", bob),
-        Ok(true),
-    );
-    contract.on_mpc_deposit_verified(
-        charlie.clone(), "SOL".to_string(), U128(500_000_000_000), // 500 SOL in lamports
-        "mpc-sol-charlie".to_string(),
-        format!("mpc:deposit:{}:SOL", charlie),
-        Ok(true),
-    );
-
-    // --- Place orders ---
-    testing_env!(context.predecessor_account_id(alice.clone()).build());
-    let id_a = contract.make_intent(
-        "BTC".to_string(), u(100_000_000),
-        "ETH".to_string(), u(10_000_000_000_000_000_000),
-    );
-
-    testing_env!(context.predecessor_account_id(bob.clone()).build());
-    let id_b = contract.make_intent(
-        "ETH".to_string(), u(10_000_000_000_000_000_000),
-        "SOL".to_string(), u(500_000_000_000),
-    );
-
-    testing_env!(context.predecessor_account_id(charlie.clone()).build());
-    let id_c = contract.make_intent(
-        "SOL".to_string(), u(500_000_000_000),
-        "BTC".to_string(), u(100_000_000),
-    );
-
-    // --- 3-party ring match ---
+    // Alice tries to deposit using Bob's path
     testing_env!(context
-        .predecessor_account_id(orderbook_contract())
+        .predecessor_account_id(user_alice())
         .attached_deposit(NearToken::from_near(1))
-        .prepaid_gas(Gas::from_tgas(300))
+        .prepaid_gas(Gas::from_tgas(3000))
         .build()
     );
-    let _ = contract.batch_match_intents(vec![
-        mp_with_chain(id_a, 100_000_000, 10_000_000_000_000_000_000, ChainType::BTC),
-        mp_with_chain(id_b, 10_000_000_000_000_000_000, 500_000_000_000, ChainType::ETH),
-        mp_with_chain(id_c, 500_000_000_000, 100_000_000, ChainType::SOL),
-    ]);
+    let _ = contract.deposit_from_mpc(
+        "ETH".to_string(), u(1000), "ETH".to_string(), "ECDSA".to_string(),
+        format!("eth/{}", user_bob()), [0u8; 32], None,
+    );
+}
 
-    // Verify logical balance swap correct (ring conservation)
-    assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(10_000_000_000_000_000_000));
-    assert_eq!(contract.get_balance(bob.clone(), "SOL".to_string()), u(500_000_000_000));
-    assert_eq!(contract.get_balance(charlie.clone(), "BTC".to_string()), u(100_000_000));
+#[test]
+fn test_deposit_from_mpc_then_trade() {
+    let (mut contract, mut context) = new_contract();
+    let alice = user_alice();
+    let bob = user_bob();
 
-    // sub_intents: id_a=0, id_b=1, id_c=2 → sub_a=3, sub_b=4, sub_c=5
-    let sub_a = u(3);
-    let sub_b = u(4);
-    let sub_c = u(5);
-
-    // --- All MPC signs succeed ---
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(3, ChainType::BTC, [1u8; 32], Ok(mock_sig()));
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(4, ChainType::ETH, [1u8; 32], Ok(mock_sig()));
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(5, ChainType::SOL, [1u8; 32], Ok(mock_sig()));
-
-    assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Settled);
-    assert_eq!(contract.get_sub_intent(sub_b).unwrap().status, IntentStatus::Settled);
-    assert_eq!(contract.get_sub_intent(sub_c).unwrap().status, IntentStatus::Settled);
-
-    // --- All transition verifications ---
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    let _ = contract.verify_transition_completion(sub_a, vec![1], "addr-a".to_string(), "tx-btc".to_string());
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    let _ = contract.verify_transition_completion(sub_b, vec![1], "addr-b".to_string(), "tx-eth".to_string());
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    let _ = contract.verify_transition_completion(sub_c, vec![1], "addr-c".to_string(), "tx-sol".to_string());
-
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_transition_verified(sub_a, "tx-btc".to_string(), Ok(true));
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_transition_verified(sub_b, "tx-eth".to_string(), Ok(true));
-    testing_env!(context.prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_transition_verified(sub_c, "tx-sol".to_string(), Ok(true));
-
-    // All Completed
-    assert_eq!(contract.get_sub_intent(sub_a).unwrap().status, IntentStatus::Completed);
-    assert_eq!(contract.get_sub_intent(sub_b).unwrap().status, IntentStatus::Completed);
-    assert_eq!(contract.get_sub_intent(sub_c).unwrap().status, IntentStatus::Completed);
-
-    // --- All parties withdraw ---
-    // Alice withdraws 10 ETH
+    // Alice deposits ETH via deposit_from_mpc
     testing_env!(context
         .predecessor_account_id(alice.clone())
         .attached_deposit(NearToken::from_near(1))
-        .prepaid_gas(Gas::from_tgas(300))
+        .prepaid_gas(Gas::from_tgas(3000))
         .build()
     );
-    let _ = contract.withdraw("ETH".to_string(), u(10_000_000_000_000_000_000), [20u8; 32], "eth/a".to_string(), ChainType::ETH);
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(6, ChainType::ETH, [20u8; 32], Ok(mock_sig()));
-    assert_eq!(contract.get_balance(alice, "ETH".to_string()), u(0));
+    let _ = contract.deposit_from_mpc(
+        "ETH".to_string(), u(500), "ETH".to_string(), "ECDSA".to_string(),
+        format!("eth/{}", alice), [5u8; 32], None,
+    );
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_deposit_signed(0, alice.clone(), "ETH".to_string(), u(500), "ETH".to_string(), "ECDSA".to_string(), [5u8; 32], Ok(mock_ecdsa_sig()));
 
-    // Bob withdraws 500 SOL
+    // Bob deposits SUI via deposit_from_mpc
     testing_env!(context
         .predecessor_account_id(bob.clone())
         .attached_deposit(NearToken::from_near(1))
-        .prepaid_gas(Gas::from_tgas(300))
+        .prepaid_gas(Gas::from_tgas(3000))
         .build()
     );
-    let _ = contract.withdraw("SOL".to_string(), u(500_000_000_000), [21u8; 32], "sol/b".to_string(), ChainType::SOL);
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(7, ChainType::SOL, [21u8; 32], Ok(mock_sig()));
-    assert_eq!(contract.get_balance(bob, "SOL".to_string()), u(0));
+    let _ = contract.deposit_from_mpc(
+        "SUI".to_string(), u(1000), "SUI".to_string(), "EDDSA".to_string(),
+        format!("sui/{}", bob), [0u8; 32], Some(vec![6u8; 64]),
+    );
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_deposit_signed(1, bob.clone(), "SUI".to_string(), u(1000), "SUI".to_string(), "EDDSA".to_string(), [0u8; 32], Ok(mock_eddsa_sig()));
 
-    // Charlie withdraws 1 BTC
+    assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(500));
+    assert_eq!(contract.get_balance(bob.clone(), "SUI".to_string()), u(1000));
+
+    // Now trade: Alice sells ETH for SUI, Bob sells SUI for ETH
+    let id_a = make(&mut contract, &mut context, &alice, "ETH", 500, "SUI", 1000, "alice_sui_mpc");
+    let id_b = make(&mut contract, &mut context, &bob, "SUI", 1000, "ETH", 500, "bob_eth_mpc");
+
     testing_env!(context
-        .predecessor_account_id(charlie.clone())
+        .predecessor_account_id(orderbook_contract())
         .attached_deposit(NearToken::from_near(1))
-        .prepaid_gas(Gas::from_tgas(300))
+        .prepaid_gas(Gas::from_tgas(3000))
         .build()
     );
-    let _ = contract.withdraw("BTC".to_string(), u(100_000_000), [22u8; 32], "btc/c".to_string(), ChainType::BTC);
-    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(300)).build());
-    contract.on_signed(8, ChainType::BTC, [22u8; 32], Ok(mock_sig()));
-    assert_eq!(contract.get_balance(charlie, "BTC".to_string()), u(0));
+    let _ = contract.batch_match_intents(vec![
+        mp_chain(id_a, 500, 1000, "ETH", "ECDSA"),
+        mp_chain(id_b, 1000, 500, "SUI", "EDDSA"),
+    ]);
 
-    println!("=== 3-party ring match full flow test passed! ===");
+    assert_eq!(contract.get_balance(alice.clone(), "SUI".to_string()), u(1000));
+    assert_eq!(contract.get_balance(bob.clone(), "ETH".to_string()), u(500));
+}
+
+// ========================================================================
+// LOCK AND MAKE INTENT
+// ========================================================================
+
+#[test]
+fn test_lock_and_make_intent_ecdsa() {
+    let alice = user_alice();
+    let mut context = get_context(orderbook_contract(), NearToken::from_near(0));
+    testing_env!(context.build());
+    let mut contract = Orderbook::new(mpc_contract(), light_client_contract());
+
+    // Alice calls lock_and_make_intent with ECDSA (ETH)
+    testing_env!(context
+        .predecessor_account_id(alice.clone())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let _ = contract.lock_and_make_intent(
+        "ETH".to_string(), u(1000),
+        "SUI".to_string(), u(2000),
+        0,
+        "alice_sui_mpc_addr".to_string(),
+        "ETH".to_string(), "ECDSA".to_string(),
+        format!("eth/{}", alice),
+        [7u8; 32], None,
+    );
+
+    // Simulate MPC callback success
+    testing_env!(context
+        .predecessor_account_id(orderbook_contract())
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let result = contract.on_lock_signed(
+        0, alice.clone(),
+        "ETH".to_string(), u(1000),
+        "SUI".to_string(), u(2000),
+        0, "alice_sui_mpc_addr".to_string(),
+        "ETH".to_string(), "ECDSA".to_string(),
+        format!("eth/{}", alice),
+        [7u8; 32],
+        Ok(mock_ecdsa_sig()),
+    );
+
+    assert!(result.starts_with("LockSuccess:intent_id="));
+    // Balance should be 0 (credited then debited)
+    assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(0));
+    // Intent should exist and be Open
+    assert_eq!(contract.get_open_intent_count(), 1);
+    let intents = contract.get_open_intents(u(0), 10);
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].maker, alice);
+    assert_eq!(intents[0].src_asset, "ETH");
+    assert_eq!(intents[0].src_amount, 1000);
+    assert_eq!(intents[0].dst_asset, "SUI");
+    assert_eq!(intents[0].dst_amount, 2000);
+    assert_eq!(intents[0].dst_address, "alice_sui_mpc_addr");
+}
+
+#[test]
+fn test_lock_and_make_intent_eddsa() {
+    let bob = user_bob();
+    let mut context = get_context(orderbook_contract(), NearToken::from_near(0));
+    testing_env!(context.build());
+    let mut contract = Orderbook::new(mpc_contract(), light_client_contract());
+
+    testing_env!(context
+        .predecessor_account_id(bob.clone())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let _ = contract.lock_and_make_intent(
+        "SUI".to_string(), u(500),
+        "ETH".to_string(), u(250),
+        0,
+        "bob_eth_mpc_addr".to_string(),
+        "SUI".to_string(), "EDDSA".to_string(),
+        format!("sui/{}", bob),
+        [0u8; 32], Some(vec![8u8; 64]),
+    );
+
+    testing_env!(context
+        .predecessor_account_id(orderbook_contract())
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let result = contract.on_lock_signed(
+        0, bob.clone(),
+        "SUI".to_string(), u(500),
+        "ETH".to_string(), u(250),
+        0, "bob_eth_mpc_addr".to_string(),
+        "SUI".to_string(), "EDDSA".to_string(),
+        format!("sui/{}", bob),
+        [0u8; 32],
+        Ok(mock_eddsa_sig()),
+    );
+
+    assert!(result.starts_with("LockSuccess:intent_id="));
+    assert_eq!(contract.get_balance(bob.clone(), "SUI".to_string()), u(0));
+    assert_eq!(contract.get_open_intent_count(), 1);
+}
+
+#[test]
+fn test_lock_failure_no_intent_created() {
+    let alice = user_alice();
+    let mut context = get_context(orderbook_contract(), NearToken::from_near(0));
+    testing_env!(context.build());
+    let mut contract = Orderbook::new(mpc_contract(), light_client_contract());
+
+    testing_env!(context
+        .predecessor_account_id(alice.clone())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let _ = contract.lock_and_make_intent(
+        "ETH".to_string(), u(100),
+        "SUI".to_string(), u(200),
+        0, "addr".to_string(),
+        "ETH".to_string(), "ECDSA".to_string(),
+        format!("eth/{}", alice),
+        [0u8; 32], None,
+    );
+
+    // MPC callback fails
+    testing_env!(context
+        .predecessor_account_id(orderbook_contract())
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let result = contract.on_lock_signed(
+        0, alice.clone(),
+        "ETH".to_string(), u(100),
+        "SUI".to_string(), u(200),
+        0, "addr".to_string(),
+        "ETH".to_string(), "ECDSA".to_string(),
+        format!("eth/{}", alice),
+        [0u8; 32],
+        Err(near_sdk::PromiseError::Failed),
+    );
+
+    assert_eq!(result, "LockFailed");
+    assert_eq!(contract.get_balance(alice.clone(), "ETH".to_string()), u(0));
+    assert_eq!(contract.get_open_intent_count(), 0);
+}
+
+#[test]
+#[should_panic(expected = "Derivation path must belong to the caller")]
+fn test_lock_wrong_path_panics() {
+    let alice = user_alice();
+    let bob = user_bob();
+    let mut context = get_context(orderbook_contract(), NearToken::from_near(0));
+    testing_env!(context.build());
+    let mut contract = Orderbook::new(mpc_contract(), light_client_contract());
+
+    testing_env!(context
+        .predecessor_account_id(alice.clone())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    // Alice uses Bob's path — should panic
+    contract.lock_and_make_intent(
+        "ETH".to_string(), u(100),
+        "SUI".to_string(), u(200),
+        0, "addr".to_string(),
+        "ETH".to_string(), "ECDSA".to_string(),
+        format!("eth/{}", bob),
+        [0u8; 32], None,
+    );
+}
+
+#[test]
+fn test_lock_then_match_full_flow() {
+    let alice = user_alice();
+    let bob = user_bob();
+    let mut context = get_context(orderbook_contract(), NearToken::from_near(0));
+    testing_env!(context.build());
+    let mut contract = Orderbook::new(mpc_contract(), light_client_contract());
+
+    // Alice locks ETH → intent to buy SUI
+    testing_env!(context
+        .predecessor_account_id(alice.clone())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let _ = contract.lock_and_make_intent(
+        "ETH".to_string(), u(500),
+        "SUI".to_string(), u(1000),
+        0, "alice_sui_addr".to_string(),
+        "ETH".to_string(), "ECDSA".to_string(),
+        format!("eth/{}", alice),
+        [1u8; 32], None,
+    );
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_lock_signed(
+        0, alice.clone(),
+        "ETH".to_string(), u(500), "SUI".to_string(), u(1000),
+        0, "alice_sui_addr".to_string(),
+        "ETH".to_string(), "ECDSA".to_string(), format!("eth/{}", alice), [1u8; 32],
+        Ok(mock_ecdsa_sig()),
+    );
+
+    // Bob locks SUI → intent to buy ETH
+    testing_env!(context
+        .predecessor_account_id(bob.clone())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let _ = contract.lock_and_make_intent(
+        "SUI".to_string(), u(1000),
+        "ETH".to_string(), u(500),
+        0, "bob_eth_addr".to_string(),
+        "SUI".to_string(), "EDDSA".to_string(),
+        format!("sui/{}", bob),
+        [0u8; 32], Some(vec![9u8; 64]),
+    );
+    testing_env!(context.predecessor_account_id(orderbook_contract()).prepaid_gas(Gas::from_tgas(3000)).build());
+    contract.on_lock_signed(
+        2, bob.clone(),
+        "SUI".to_string(), u(1000), "ETH".to_string(), u(500),
+        0, "bob_eth_addr".to_string(),
+        "SUI".to_string(), "EDDSA".to_string(), format!("sui/{}", bob), [0u8; 32],
+        Ok(mock_eddsa_sig()),
+    );
+
+    assert_eq!(contract.get_open_intent_count(), 2);
+
+    // Get the actual intent IDs from the open intents
+    let open = contract.get_open_intents(u(0), 10);
+    let id_a = U128(open.iter().find(|i| i.maker == alice).unwrap().id as u128);
+    let id_b = U128(open.iter().find(|i| i.maker == bob).unwrap().id as u128);
+
+    // Relayer matches them
+    testing_env!(context
+        .predecessor_account_id(orderbook_contract())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(Gas::from_tgas(3000))
+        .build()
+    );
+    let _ = contract.batch_match_intents(vec![
+        mp_chain(id_a, 500, 1000, "ETH", "ECDSA"),
+        mp_chain(id_b, 1000, 500, "SUI", "EDDSA"),
+    ]);
+
+    // After matching, counterparty funds are credited
+    assert_eq!(contract.get_balance(alice.clone(), "SUI".to_string()), u(1000));
+    assert_eq!(contract.get_balance(bob.clone(), "ETH".to_string()), u(500));
+    assert_eq!(contract.get_open_intent_count(), 0);
 }
