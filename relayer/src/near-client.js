@@ -4,7 +4,7 @@
  * Handles:
  *   1. Connecting to NEAR testnet via near-api-js
  *   2. View calls to the orderbook contract (get_open_intents, etc.)
- *   3. Function calls (batch_match_intents, verify_transition_completion)
+ *   3. Function calls (batch_match_intents)
  *   4. Parsing transaction receipts for EVENT_JSON signature events
  */
 
@@ -151,26 +151,6 @@ async function batchMatchIntents(matches) {
   return outcome;
 }
 
-/**
- * Submit verify_transition_completion with proof data.
- */
-async function verifyTransitionCompletion(subIntentId, proofData, recipient, txHash) {
-  const outcome = await relayerAccount.functionCall({
-    contractId: config.contractId,
-    methodName: "verify_transition_completion",
-    args: {
-      sub_intent_id: String(subIntentId),
-      proof_data: Array.from(proofData),
-      recipient,
-      tx_hash: txHash,
-    },
-    gas: "200000000000000", // 200 TGas
-    attachedDeposit: "0",
-  });
-
-  return outcome;
-}
-
 // ========================================================================
 // Log / Event Parsing
 // ========================================================================
@@ -244,6 +224,29 @@ function printOutcomeLogs(outcome) {
   }
 }
 
+// ========================================================================
+// Broadcast Queue
+// ========================================================================
+
+async function getBroadcastQueue(limit = 50) {
+  return relayerAccount.viewFunction({
+    contractId: config.contractId,
+    methodName: "get_broadcast_queue",
+    args: { limit },
+  });
+}
+
+async function ackBroadcast(id) {
+  const outcome = await relayerAccount.functionCall({
+    contractId: config.contractId,
+    methodName: "ack_broadcast",
+    args: { id: String(id) },
+    gas: "30000000000000",
+    attachedDeposit: "0",
+  });
+  return outcome;
+}
+
 module.exports = {
   init,
   getOpenIntents,
@@ -254,7 +257,8 @@ module.exports = {
   getBalance,
   deriveMpcPublicKey,
   batchMatchIntents,
-  verifyTransitionCompletion,
+  getBroadcastQueue,
+  ackBroadcast,
   parseSignatureEvents,
   printOutcomeLogs,
 };

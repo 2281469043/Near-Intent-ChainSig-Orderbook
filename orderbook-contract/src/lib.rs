@@ -57,16 +57,6 @@ pub trait LightClient {
         expected_amount: U128,
         expected_memo: String,
     ) -> bool;
-    fn verify_transition_proof(
-        &self,
-        chain: String,
-        proof_data: Vec<u8>,
-        expected_recipient: String,
-        expected_asset: String,
-        expected_amount: U128,
-        expected_memo: String,
-        expected_tx_hash: String,
-    ) -> bool;
 }
 
 #[ext_contract(ext_self)]
@@ -80,7 +70,6 @@ pub trait SelfContract {
         memo: String,
         tx_hash: String,
     );
-    fn on_transition_verified(&mut self, sub_intent_id: U128, tx_hash: String);
     fn on_signed(&mut self, id: u64, chain: String, sign_scheme: String, payload: [u8; 32]) -> String;
     fn on_deposit_signed(&mut self, id: u64, user: AccountId, asset: String, amount: U128, chain: String, sign_scheme: String, payload: [u8; 32]) -> String;
     fn on_lock_signed(
@@ -163,6 +152,38 @@ pub struct PendingWithdrawal {
     pub amount: u128,
 }
 
+/// Metadata stored when an MPC-signed operation is initiated, so the Relayer
+/// can reconstruct the unsigned transaction for broadcasting.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct OperationMeta {
+    pub chain: String,
+    pub sign_scheme: String,
+    pub path: String,
+    pub to_address: String,
+    pub amount: u128,
+    pub unsigned_tx: String,
+}
+
+/// An MPC-signed transaction waiting for the Relayer to broadcast.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct BroadcastTask {
+    pub id: u64,
+    pub chain: String,
+    pub sign_scheme: String,
+    pub path: String,
+    pub to_address: String,
+    pub amount: U128,
+    pub unsigned_tx: String,
+    pub big_r: String,
+    pub s_value: String,
+    pub recovery_id: u8,
+    pub signature_hex: String,
+    pub payload_hex: String,
+    pub created_at: u64,
+}
+
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize)]
 #[serde(crate = "near_sdk::serde")]
 pub struct MatchParams {
@@ -182,6 +203,16 @@ pub struct MatchParams {
     pub eddsa_payload: Option<Vec<u8>>,
 }
 
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[serde(crate = "near_sdk::serde")]
+pub struct DepositEvent {
+    pub user: AccountId,
+    pub asset: String,
+    pub amount: u128,
+    pub tx_hash: String,
+    pub timestamp: u64,
+}
+
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
 pub struct Orderbook {
@@ -194,12 +225,15 @@ pub struct Orderbook {
     pub transition_expectations: UnorderedMap<u64, TransitionExpectation>,
     pub pending_withdrawals: UnorderedMap<u64, PendingWithdrawal>,
     pub next_id: u64,
-    /// Fast lookup: set of all Open intent IDs.
     pub open_intent_ids: UnorderedSet<u64>,
-    /// Pair index: "src_asset:dst_asset" -> list of open intent IDs.
     pub pair_index: UnorderedMap<String, Vec<u64>>,
-    /// Replay protection: set of verified deposit tx hashes.
     pub verified_deposits: UnorderedSet<String>,
+    /// Recent deposit events confirmed by Oracle, queryable from frontend.
+    pub deposit_events: Vec<DepositEvent>,
+    /// Metadata for in-flight MPC operations (withdraw / withdraw_from_mpc).
+    pub operation_metas: UnorderedMap<u64, OperationMeta>,
+    /// Signed transactions waiting for the Relayer to broadcast to external chains.
+    pub broadcast_queue: UnorderedMap<u64, BroadcastTask>,
 }
 
 impl ContractState for Orderbook {}
@@ -212,16 +246,19 @@ impl Orderbook {
             owner: env::predecessor_account_id(),
             mpc_contract,
             light_client_contract,
-            // Disjoint prefixes prevent collection keyspace overlap.
-            balances: UnorderedMap::new(&b"balances:"[..]),
-            intents: UnorderedMap::new(&b"intents:"[..]),
-            sub_intents: UnorderedMap::new(&b"sub_intents:"[..]),
-            transition_expectations: UnorderedMap::new(&b"transition_expectations:"[..]),
-            pending_withdrawals: UnorderedMap::new(&b"pending_withdrawals:"[..]),
+            // v2 prefixes intentionally avoid stale keys from previous deployments.
+            balances: UnorderedMap::new(&b"v2:balances:"[..]),
+            intents: UnorderedMap::new(&b"v2:intents:"[..]),
+            sub_intents: UnorderedMap::new(&b"v2:sub_intents:"[..]),
+            transition_expectations: UnorderedMap::new(&b"v2:transition_expectations:"[..]),
+            pending_withdrawals: UnorderedMap::new(&b"v2:pending_withdrawals:"[..]),
             next_id: 0,
-            open_intent_ids: UnorderedSet::new(&b"open_intent_ids:"[..]),
-            pair_index: UnorderedMap::new(&b"pair_index:"[..]),
-            verified_deposits: UnorderedSet::new(&b"verified_deposits:"[..]),
+            open_intent_ids: UnorderedSet::new(&b"v2:open_intent_ids:"[..]),
+            pair_index: UnorderedMap::new(&b"v2:pair_index:"[..]),
+            verified_deposits: UnorderedSet::new(&b"v2:verified_deposits:"[..]),
+            deposit_events: Vec::new(),
+            operation_metas: UnorderedMap::new(&b"v2:operation_metas:"[..]),
+            broadcast_queue: UnorderedMap::new(&b"v2:broadcast_queue:"[..]),
         }
     }
 
@@ -245,7 +282,7 @@ impl Orderbook {
         );
         let amount: u128 = amount.into();
         let mut user_balances = self.balances.get(&user).unwrap_or_else(|| {
-            UnorderedMap::new(format!("user_balances:{}", user).as_bytes())
+            UnorderedMap::new(format!("v2:user_balances:{}", user).as_bytes())
         });
         let current = user_balances.get(&asset).unwrap_or(0);
         user_balances.insert(&asset, &(current + amount));
@@ -310,6 +347,60 @@ impl Orderbook {
             user, asset, amount.0, tx_hash, recipient, memo
         ));
         "MpcDepositCredited".to_string()
+    }
+
+    // ========================================================================
+    // 1a-2. Credit Deposit (called by Oracle contract automatically)
+    // ========================================================================
+
+    /// Called by the Oracle contract after enough oracle nodes have attested
+    /// to a deposit transaction on an external chain.
+    ///
+    /// Only the registered `light_client_contract` (Oracle) can call this.
+    /// This is the final step — no user action required.
+    pub fn credit_deposit(
+        &mut self,
+        user: AccountId,
+        asset: String,
+        amount: U128,
+        tx_hash: String,
+    ) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.light_client_contract,
+            "Only Oracle contract can credit deposits"
+        );
+        assert!(
+            !self.verified_deposits.contains(&tx_hash),
+            "Deposit tx_hash already credited (replay)"
+        );
+
+        self.verified_deposits.insert(&tx_hash);
+        let amount_u128: u128 = amount.into();
+        let mut user_balances = self.balances.get(&user).unwrap_or_else(|| {
+            UnorderedMap::new(format!("v2:user_balances:{}", user).as_bytes())
+        });
+        let current = user_balances.get(&asset).unwrap_or(0);
+        user_balances.insert(&asset, &(current + amount_u128));
+        self.balances.insert(&user, &user_balances);
+
+        let event = DepositEvent {
+            user: user.clone(),
+            asset: asset.clone(),
+            amount: amount_u128,
+            tx_hash: tx_hash.clone(),
+            timestamp: env::block_timestamp(),
+        };
+        self.deposit_events.push(event);
+        // Keep only the last 50 events to bound storage.
+        if self.deposit_events.len() > 50 {
+            self.deposit_events = self.deposit_events.split_off(self.deposit_events.len() - 50);
+        }
+
+        env::log_str(&format!(
+            "DEPOSIT_CREDITED:user={},asset={},amount={},tx_hash={}",
+            user, asset, amount_u128, tx_hash
+        ));
     }
 
     // ========================================================================
@@ -681,15 +772,6 @@ impl Orderbook {
             self.sub_intents.insert(&sub_id, &sub_intent);
             sub_ids.push(sub_id);
 
-            let expectation = TransitionExpectation {
-                sub_intent_id: sub_id,
-                chain: m.chain.clone(),
-                expected_asset: intent.src_asset.clone(),
-                expected_amount: fill_amount,
-                expected_memo: format!("transition:sub:{}", sub_id),
-            };
-            self.transition_expectations.insert(&sub_id, &expectation);
-
             // Credit maker with what they bought
             self.internal_transfer(intent.maker.clone(), intent.dst_asset.clone(), get_amount);
 
@@ -754,7 +836,7 @@ impl Orderbook {
 
     fn internal_transfer(&mut self, user: AccountId, asset: String, amount: u128) {
         let mut bals = self.balances.get(&user).unwrap_or_else(|| {
-            UnorderedMap::new(format!("user_balances:{}", user).as_bytes())
+            UnorderedMap::new(format!("v2:user_balances:{}", user).as_bytes())
         });
         let cur = bals.get(&asset).unwrap_or(0);
         bals.insert(&asset, &(cur + amount));
@@ -904,20 +986,9 @@ impl Orderbook {
         sub_mut.status = IntentStatus::Verifying;
         self.sub_intents.insert(&sub_intent_id, &sub_mut);
 
-        let parent = self
-            .intents
+        self.intents
             .get(&sub.parent_intent_id)
             .expect("Parent intent not found");
-
-        let expectation = TransitionExpectation {
-            sub_intent_id,
-            chain: chain.clone(),
-            expected_asset: parent.src_asset.clone(),
-            expected_amount: sub.amount,
-            expected_memo: format!("transition:sub:{}", sub_intent_id),
-        };
-        self.transition_expectations
-            .insert(&sub_intent_id, &expectation);
 
         let (request, phash) = build_sign_request(
             &sign_scheme, &payload, &path, &eddsa_payload,
@@ -943,6 +1014,8 @@ impl Orderbook {
         &mut self,
         asset: String,
         amount: U128,
+        to_address: String,
+        unsigned_tx: String,
         payload: [u8; 32],
         path: String,
         chain: String,
@@ -969,7 +1042,16 @@ impl Orderbook {
             },
         );
 
-        env::log_str(&format!("Withdrawing {} {} for user {} (wd_id={})", amount, asset, user, wd_id));
+        self.operation_metas.insert(&wd_id, &OperationMeta {
+            chain: chain.clone(),
+            sign_scheme: sign_scheme.clone(),
+            path: path.clone(),
+            to_address: to_address.clone(),
+            amount,
+            unsigned_tx,
+        });
+
+        env::log_str(&format!("Withdrawing {} {} for user {} → {} (wd_id={})", amount, asset, user, to_address, wd_id));
 
         let (request, phash) = build_sign_request(
             &sign_scheme, &payload, &path, &eddsa_payload,
@@ -993,24 +1075,23 @@ impl Orderbook {
     /// Lets a user move funds from their personal MPC-derived address on an
     /// external chain to any wallet they own (e.g. MetaMask, Sui Wallet).
     ///
-    /// The caller must build the unsigned tx off-chain (from: user's MPC addr,
-    /// to: user's wallet) and pass the payload here. The contract verifies that
-    /// the derivation path belongs to the caller, then asks MPC to sign.
-    ///
     /// Unlike `withdraw`, this does NOT touch internal balances — the funds
     /// live on the external chain in the user's MPC address.
+    /// The Relayer will pick up the signed result and broadcast automatically.
     #[payable]
     pub fn withdraw_from_mpc(
         &mut self,
         chain: String,
         sign_scheme: String,
         path: String,
+        to_address: String,
+        amount: U128,
+        unsigned_tx: String,
         payload: [u8; 32],
         eddsa_payload: Option<Vec<u8>>,
     ) -> Promise {
         let caller = env::predecessor_account_id();
 
-        // Security: derivation path must contain the caller's account ID
         assert!(
             path.contains(caller.as_str()),
             "Derivation path must belong to the caller (must contain '{}')",
@@ -1020,9 +1101,18 @@ impl Orderbook {
         let wd_id = self.next_id;
         self.next_id += 1;
 
+        self.operation_metas.insert(&wd_id, &OperationMeta {
+            chain: chain.clone(),
+            sign_scheme: sign_scheme.clone(),
+            path: path.clone(),
+            to_address: to_address.clone(),
+            amount: amount.into(),
+            unsigned_tx,
+        });
+
         env::log_str(&format!(
-            "WithdrawFromMPC:user={},chain={},path={},wd_id={}",
-            caller, chain, path, wd_id
+            "WithdrawFromMPC:user={},chain={},path={},to={},wd_id={}",
+            caller, chain, path, to_address, wd_id
         ));
 
         let (request, phash) = build_sign_request(
@@ -1041,71 +1131,7 @@ impl Orderbook {
     }
 
     // ========================================================================
-    // 6. Transition Verification
-    // ========================================================================
-
-    #[payable]
-    pub fn verify_transition_completion(
-        &mut self,
-        sub_intent_id: U128,
-        proof_data: Vec<u8>,
-        recipient: String,
-        tx_hash: String,
-    ) -> Promise {
-        let sub_intent_id: u64 = sub_intent_id.0 as u64;
-        let mut sub = self.sub_intents.get(&sub_intent_id).expect("Sub-Intent not found");
-        assert_eq!(sub.status, IntentStatus::Settled, "Sub-Intent is not ready for transition verification");
-        let expectation = self
-            .transition_expectations
-            .get(&sub_intent_id)
-            .expect("Transition expectation not found");
-        sub.status = IntentStatus::TransitionVerifying;
-        self.sub_intents.insert(&sub_intent_id, &sub);
-
-        ext_light_client::ext(self.light_client_contract.clone())
-            .with_static_gas(Gas::from_tgas(50))
-            .verify_transition_proof(
-                expectation.chain.clone(),
-                proof_data,
-                recipient,
-                expectation.expected_asset.clone(),
-                U128(expectation.expected_amount),
-                expectation.expected_memo.clone(),
-                tx_hash.clone(),
-            )
-            .then(
-                ext_self::ext(env::current_account_id())
-                    .with_static_gas(Gas::from_tgas(40))
-                    .on_transition_verified(U128(sub_intent_id.into()), tx_hash),
-            )
-    }
-
-    #[private]
-    pub fn on_transition_verified(
-        &mut self,
-        sub_intent_id: U128,
-        tx_hash: String,
-        #[callback_result] verify_result: Result<bool, PromiseError>,
-    ) -> String {
-        let id = sub_intent_id.0 as u64;
-        let is_valid = verify_result.unwrap_or(false);
-        let mut sub = self.sub_intents.get(&id).expect("Sub-Intent not found");
-        if is_valid {
-            sub.status = IntentStatus::Completed;
-            self.sub_intents.insert(&id, &sub);
-            self.transition_expectations.remove(&id);
-            env::log_str(&format!("TRANSITION_VERIFIED:sub_intent_id={},tx_hash={}", id, tx_hash));
-            "TransitionVerified".to_string()
-        } else {
-            sub.status = IntentStatus::Settled;
-            self.sub_intents.insert(&id, &sub);
-            env::log_str(&format!("TRANSITION_VERIFY_FAILED:sub_intent_id={}", id));
-            "TransitionVerifyFailed".to_string()
-        }
-    }
-
-    // ========================================================================
-    // 7. MPC Sign Callback (shared by batch_match, retry, withdraw)
+    // 6. MPC Sign Callback (shared by batch_match, retry, withdraw)
     // ========================================================================
 
     #[private]
@@ -1121,7 +1147,7 @@ impl Orderbook {
             Ok(res) => {
                 if let Some(mut sub) = self.sub_intents.get(&id) {
                     if sub.status == IntentStatus::Verifying {
-                        sub.status = IntentStatus::Settled;
+                        sub.status = IntentStatus::Completed;
                         self.sub_intents.insert(&id, &sub);
                     }
                 }
@@ -1133,10 +1159,30 @@ impl Orderbook {
 
                 let event = build_signature_event(
                     res, id, chain, sign_scheme, payload,
-                    format!("transition:sub:{}", id),
+                    format!("settlement:sub:{}", id),
                 );
                 let event_json = near_sdk::serde_json::to_string(&event).unwrap();
                 env::log_str(&format!("EVENT_JSON:{}", event_json));
+
+                if let Some(meta) = self.operation_metas.get(&id) {
+                    self.broadcast_queue.insert(&id, &BroadcastTask {
+                        id,
+                        chain: meta.chain.clone(),
+                        sign_scheme: meta.sign_scheme.clone(),
+                        path: meta.path.clone(),
+                        to_address: meta.to_address.clone(),
+                        amount: U128(meta.amount),
+                        unsigned_tx: meta.unsigned_tx.clone(),
+                        big_r: event.big_r.clone(),
+                        s_value: event.s.clone(),
+                        recovery_id: event.recovery_id,
+                        signature_hex: event.signature.clone(),
+                        payload_hex: event.payload.clone(),
+                        created_at: env::block_timestamp(),
+                    });
+                    self.operation_metas.remove(&id);
+                    env::log_str(&format!("BROADCAST_QUEUED:id={}", id));
+                }
 
                 "Success".to_string()
             }
@@ -1144,7 +1190,6 @@ impl Orderbook {
                 if let Some(mut sub) = self.sub_intents.get(&id) {
                     sub.status = IntentStatus::Taken;
                     self.sub_intents.insert(&id, &sub);
-                    self.transition_expectations.remove(&id);
                 }
                 if let Some(wd) = self.pending_withdrawals.get(&id) {
                     self.internal_transfer(wd.user.clone(), wd.asset.clone(), wd.amount);
@@ -1154,23 +1199,36 @@ impl Orderbook {
                         wd.user, wd.asset, wd.amount
                     ));
                 }
+                self.operation_metas.remove(&id);
                 "Failed".to_string()
             }
         }
     }
 
     // ========================================================================
+    // 7. Broadcast Queue (Relayer polls this to broadcast signed txs)
+    // ========================================================================
+
+    /// Relayer calls this after successfully broadcasting a signed tx.
+    pub fn ack_broadcast(&mut self, id: U128) {
+        let id_u64 = id.0 as u64;
+        assert!(
+            self.broadcast_queue.get(&id_u64).is_some(),
+            "Broadcast task not found"
+        );
+        self.broadcast_queue.remove(&id_u64);
+        env::log_str(&format!("BROADCAST_ACKED:id={}", id_u64));
+    }
+
+    // ========================================================================
     // 8. Cleanup completed SubIntents (release storage)
     // ========================================================================
 
-    /// Remove a Completed SubIntent and its parent Intent (if Filled/Cancelled)
-    /// to free on-chain storage. Anyone can call this.
     pub fn cleanup_completed(&mut self, sub_intent_id: U128) {
         let sid = sub_intent_id.0 as u64;
         let sub = self.sub_intents.get(&sid).expect("Sub-Intent not found");
         assert_eq!(sub.status, IntentStatus::Completed, "Can only clean up Completed sub-intents");
         self.sub_intents.remove(&sid);
-        self.transition_expectations.remove(&sid);
         env::log_str(&format!("Cleaned up sub-intent #{}", sid));
     }
 
@@ -1184,10 +1242,6 @@ impl Orderbook {
 
     pub fn get_sub_intent(&self, id: U128) -> Option<SubIntent> {
         self.sub_intents.get(&(id.0 as u64))
-    }
-
-    pub fn get_transition_expectation(&self, id: U128) -> Option<TransitionExpectation> {
-        self.transition_expectations.get(&(id.0 as u64))
     }
 
     /// Returns Open intents using the dedicated index (O(k) where k = open count).
@@ -1222,6 +1276,24 @@ impl Orderbook {
             .map(|b: UnorderedMap<String, u128>| b.get(&asset).unwrap_or(0))
             .unwrap_or(0)
             .into()
+    }
+
+    /// Returns the most recent deposit events (up to `limit`).
+    pub fn get_deposit_events(&self, limit: Option<u32>) -> Vec<DepositEvent> {
+        let n = limit.unwrap_or(20).min(50) as usize;
+        let len = self.deposit_events.len();
+        let start = if len > n { len - n } else { 0 };
+        self.deposit_events[start..].to_vec()
+    }
+
+    /// Returns all pending broadcast tasks for the Relayer.
+    pub fn get_broadcast_queue(&self, limit: Option<u32>) -> Vec<BroadcastTask> {
+        let n = limit.unwrap_or(50) as usize;
+        self.broadcast_queue
+            .iter()
+            .take(n)
+            .map(|(_, task)| task)
+            .collect()
     }
 }
 

@@ -1,114 +1,69 @@
 # Cross-Chain Intent Orderbook with NEAR MPC Chain Signatures
 
-A trustless cross-chain orderbook built on NEAR Protocol that enables atomic swaps between external chains (ETH, SOL, BTC) using **NEAR Chain Signatures (MPC)** for keyless cross-chain signing.
-
-> **Testnet Demo**: A real MPC-signed ETH transfer has been successfully executed on Sepolia:
-> [View on Etherscan](https://sepolia.etherscan.io/tx/0x92803988ba9dd208857c8be16fd4ff46ac5055ae4cef6c5f8e7dd8a1a9af18a8)
+A trustless cross-chain orderbook built on NEAR Protocol that enables atomic swaps between external chains (Ethereum Sepolia, SUI Testnet, Avalanche Fuji) using **NEAR Chain Signatures (MPC)** for keyless cross-chain signing and **oracle-based deposit verification**.
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          NEAR Blockchain                             │
-│                                                                      │
-│  ┌────────────────────┐    ┌─────────────────┐   ┌───────────────┐  │
-│  │  Orderbook Contract │───▶│  MPC Contract   │   │  Light Client │  │
-│  │  (ob.kaiyang.testnet)│   │ (v1.signer-prod)│   │(lc.kaiyang..) │  │
-│  │                      │   │                 │   │               │  │
-│  │  • Intents           │   │  • sign()       │   │ • verify_     │  │
-│  │  • Batch Matching    │   │  • derived_     │   │   payment_    │  │
-│  │  • Balance Ledger    │   │    public_key() │   │   proof()     │  │
-│  │  • MPC Callbacks     │   │                 │   │ • verify_     │  │
-│  │  • Withdrawals       │   │                 │   │   transition_ │  │
-│  └──────────┬───────────┘   └────────┬────────┘   │   proof()     │  │
-│             │                        │             └───────────────┘  │
-└─────────────┼────────────────────────┼───────────────────────────────┘
-              │ sign request           │ ECDSA signature
-              │                        ▼
-    ┌─────────┴────────────────────────────────────┐
-    │            External Chains                    │
-    │                                               │
-    │   Ethereum (Sepolia)    Solana (Devnet)       │
-    │   ┌──────────────┐     ┌──────────────┐      │
-    │   │ MPC Address  │     │ MPC Address  │      │
-    │   │ 0x76d757..   │     │ (derived)    │      │
-    │   │              │     │              │      │
-    │   │ Sends ETH    │     │ Sends SOL    │      │
-    │   │ via MPC sig  │     │ via MPC sig  │      │
-    │   └──────────────┘     └──────────────┘      │
-    └──────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           NEAR Blockchain (Testnet)                     │
+│                                                                         │
+│  ┌──────────────────────┐   ┌──────────────────┐   ┌────────────────┐  │
+│  │  Orderbook Contract  │   │  Oracle Contract  │   │  MPC Signer    │  │
+│  │  ob.kaiyang.testnet  │◄──│  lc.kaiyang.testnet│  │  v1.signer-prod│  │
+│  │                      │   │                    │   │                │  │
+│  │  • Balance Ledger    │   │  • attest()        │   │  • sign()      │  │
+│  │  • Intents & Match   │   │  • Multi-oracle    │   │  • derived_    │  │
+│  │  • MPC Sign Trigger  │   │    threshold       │   │    public_key()│  │
+│  │  • credit_deposit()  │◄──│  • credit_deposit  │   │                │  │
+│  │  • Withdrawals       │   │    cross-call      │   │                │  │
+│  └──────────┬───────────┘   └────────▲───────────┘   └───────▲────────┘  │
+│             │ sign request           │ attest()              │ signature │
+└─────────────┼────────────────────────┼───────────────────────┼──────────┘
+              │                        │                       │
+     ┌────────▼────────┐    ┌─────────┴─────────┐    ┌───────┴────────┐
+     │  Frontend (UI)  │    │   Oracle Node     │    │    Relayer     │
+     │  React + Vite   │    │   Node.js         │    │    Node.js     │
+     │  localhost:5173  │───▶│   localhost:8787  │    │                │
+     │                  │    │   POST /review    │    │  Match + Sign  │
+     └────────┬─────────┘    └──────────────────┘    │  + Broadcast   │
+              │                                       └───────┬────────┘
+              │                                               │
+     ┌────────▼───────────────────────────────────────────────▼────────┐
+     │                      External Chains                            │
+     │                                                                 │
+     │   Ethereum Sepolia       SUI Testnet         Avalanche Fuji     │
+     │   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐     │
+     │   │ MPC Address  │    │ MPC Address  │    │ MPC Address  │     │
+     │   │ (secp256k1)  │    │ (ed25519)    │    │ (secp256k1)  │     │
+     │   └──────────────┘    └──────────────┘    └──────────────┘     │
+     └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## How It Works
 
-### Intent Lifecycle
+### Complete Flow
 
-```
-User deposits ──▶ Make Intent (Open) ──▶ Batch Match ──▶ MPC Sign ──▶ Settled ──▶ Transition Verify ──▶ Completed
-                                              │
-                                              ├── Auto-triggers MPC signing
-                                              ├── Credits maker with bought asset
-                                              └── Emits EVENT_JSON with signature
-```
-
-### Step-by-Step Flow
-
-#### 1. Deposit
-
-Users deposit external-chain assets into the orderbook. The contract tracks balances internally.
-
-- **Admin deposit** (`deposit_for`): For testing/bootstrapping.
-- **Verified deposit** (`verify_mpc_deposit`): Production path — user sends assets to their MPC-derived address, then submits a proof. The light client verifies the proof, and the contract credits the balance.
-
-#### 2. Make Intent
-
-A user creates a swap intent specifying what they want to sell and buy:
-
-```
-kaiyang.testnet: "I sell 1 SOL, I want 0.01 ETH"
-shangguan.testnet: "I sell 0.01 ETH, I want 1 SOL"
-```
-
-The source asset amount is deducted from the maker's internal balance.
-
-#### 3. Batch Match + Auto MPC Sign
-
-A solver (or relayer) calls `batch_match_intents` with a set of matching intents. The contract:
-
-1. **Validates** price fairness for each match (no underpaying)
-2. **Checks solvency** — total supply of each asset must cover total demand
-3. **Creates sub-intents** for each matched portion
-4. **Credits makers** with their purchased assets
-5. **Auto-triggers MPC signing** for each sub-intent's outbound transfer
-
-The MPC contract (`v1.signer-prod.testnet`) returns ECDSA signatures via a callback (`on_signed`), which the contract emits as `EVENT_JSON` log events.
-
-#### 4. Broadcast External Transaction
-
-An off-chain relayer picks up the `EVENT_JSON` events, assembles signed transactions (e.g., EIP-1559 ETH tx), and broadcasts them to the target chain.
-
-#### 5. Transition Verification
-
-After the external transaction confirms, a relayer submits proof via `verify_transition_completion`. The light client verifies that the transaction actually occurred on-chain, and the sub-intent moves to `Completed`.
-
-#### 6. Withdrawal
-
-Users can withdraw their internal balance to any external address by calling `withdraw`. This triggers MPC signing for an outbound transfer. If MPC signing fails, the balance is automatically refunded.
+1. **Deposit**: User sends ETH/SUI/AVAX from their wallet to their MPC-derived address on the external chain
+2. **Oracle Verification**: User (or anyone) requests oracle review → oracle verifies tx on-chain → attests to Light Client → balance credited on NEAR
+3. **Create Intent**: User posts a swap intent ("sell X ETH, want Y SUI")
+4. **Match**: Relayer finds compatible intents, submits batch match → contract triggers MPC signing
+5. **Broadcast**: MPC signatures are emitted as events; relayer assembles and broadcasts signed txs to external chains
+6. **Withdrawal**: User withdraws internal balance to any external wallet via MPC-signed transaction
 
 ### MPC Address Derivation
 
-Each NEAR account + derivation path combination maps to a unique external-chain address:
+Each `(NEAR_account, path)` pair maps to a unique external-chain address:
 
-| NEAR Account | Path | Controls |
-|-------------|------|----------|
-| `ob.kaiyang.testnet` (contract) | `eth/1` | Contract's ETH pool (`0x76d7...`) |
-| `kaiyang.testnet` (user) | `eth/1` | User's personal ETH wallet (`0xAeeF...`) |
-
-The MPC contract (`v1.signer-prod.testnet`) ensures only the corresponding NEAR account can request signatures for its derived addresses.
+| Path | Chain | Curve | Address |
+|------|-------|-------|---------|
+| `eth/kaiyang.testnet` | Ethereum Sepolia | secp256k1 | `0xd0cd...` |
+| `sui/shangguan.testnet` | SUI Testnet | ed25519 | `0x0fae...` |
+| `avax/kaiyang.testnet` | Avalanche Fuji | secp256k1 | `0x...` |
 
 ---
 
@@ -116,74 +71,106 @@ The MPC contract (`v1.signer-prod.testnet`) ensures only the corresponding NEAR 
 
 ```
 .
-├── orderbook-contract/        # Core NEAR smart contract
+├── orderbook-contract/          # Core NEAR smart contract (Rust)
 │   └── src/
-│       ├── lib.rs             # Contract logic (875 lines)
-│       └── tests.rs           # 44 unit tests (1826 lines)
-├── light-client/              # Light client contract for proof verification
-│   └── src/lib.rs             # Proof skeleton verification (placeholder)
-├── mock-prover/               # Mock prover (always returns true, for testing)
-│   └── src/lib.rs
-├── mpc-relayer/               # Off-chain relayer service
-│   └── src/main.rs            # Polls intents, submits batch matches
-├── scripts/
-│   ├── deploy_testnet.sh      # Deploy all contracts to NEAR testnet
-│   ├── test_real_mpc_e2e.sh   # End-to-end test with real MPC signing
-│   ├── derive_eth_address.js  # Derive ETH address from MPC contract
-│   ├── derive_sol_address.js  # Derive SOL address from MPC contract
-│   ├── eth_tx_helper.js       # Build/broadcast ETH transactions
-│   └── package.json           # Node.js dependencies
-├── Cargo.toml                 # Workspace configuration
-└── Cargo.lock
+│       ├── lib.rs               # Contract logic (1354 lines)
+│       └── tests.rs             # Unit tests (1826 lines, 44 tests)
+│
+├── light-client/                # Oracle / Light Client contract (Rust)
+│   └── src/lib.rs               # Multi-oracle attestation (224 lines)
+│
+├── frontend/                    # React + TypeScript + Vite + Tailwind
+│   └── src/
+│       ├── App.tsx              # Three-panel layout
+│       ├── WalletContext.tsx     # NEAR wallet with RPC failover
+│       ├── config.ts            # Contract IDs, RPC URLs
+│       ├── mpc.ts               # MPC derivation, TX building, broadcast
+│       ├── types.ts             # TypeScript types
+│       └── components/
+│           ├── UserPanel.tsx     # Deposit, intents, withdraw, oracle review
+│           ├── OrderBook.tsx     # Order book, ledger, events
+│           └── RelayerPanel.tsx  # Match & broadcast settlement
+│
+├── oracle-node/                 # Off-chain oracle service (Node.js)
+│   └── src/
+│       ├── index.js             # Review API + deposit monitor
+│       ├── near-client.js       # NEAR client with multi-RPC failover
+│       ├── address-resolver.js  # MPC address derivation
+│       └── config.js            # Environment config
+│
+├── relayer/                     # Off-chain relayer service (Node.js)
+│   └── src/
+│       ├── index.js             # Main loop: poll, match, sign, broadcast
+│       ├── matcher.js           # Pair + ring matching algorithms
+│       ├── eth-utils.js         # ETH TX building
+│       └── sui-utils.js         # SUI TX building
+│
+├── scripts/                     # Deploy & utility scripts
+│   ├── deploy_testnet.sh
+│   ├── derive_eth_address.js
+│   ├── derive_sui_address.js
+│   ├── eth_tx_helper.js
+│   └── sui_tx_helper.js
+│
+├── TECHNICAL_DESCRIPTION.md     # Detailed technical documentation
+├── RUNBOOK.md                   # Step-by-step CLI operation guide
+└── Cargo.toml                   # Rust workspace config
 ```
 
 ---
 
-## Testnet Deployment
+## Quick Start
 
 ### Prerequisites
 
 - [NEAR CLI](https://docs.near.org/tools/near-cli) (`near` command)
 - Rust + `wasm32-unknown-unknown` target
-- `wasm-opt` (from binaryen, for WASM optimization)
 - Node.js >= 18
+- `wasm-opt` (from binaryen)
 
-### Deploy
+### 1. Build & Deploy Contracts
 
 ```bash
-# Build the contract
+# Build orderbook contract
 cd orderbook-contract
-cargo build --target wasm32-unknown-unknown --release
+cargo +1.86.0 build --target wasm32-unknown-unknown --release
+cd ..
 
-# Optimize WASM (required for Rust 1.82+)
-wasm-opt -Oz -o target/wasm32-unknown-unknown/release/orderbook_contract.wasm.opt \
-  target/wasm32-unknown-unknown/release/orderbook_contract.wasm
-mv target/wasm32-unknown-unknown/release/orderbook_contract.wasm.opt \
-  target/wasm32-unknown-unknown/release/orderbook_contract.wasm
+# Optimize WASM
+wasm-opt -Oz target/wasm32-unknown-unknown/release/orderbook_contract.wasm \
+  -o target/orderbook_opt.wasm
 
-# Deploy (using the deploy script)
-cd scripts
-./deploy_testnet.sh
+# Deploy
+near contract deploy ob.kaiyang.testnet use-file target/orderbook_opt.wasm \
+  with-init-call migrate \
+  json-args '{"mpc_contract":"v1.signer-prod.testnet","light_client_contract":"lc.kaiyang.testnet"}' \
+  prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' \
+  network-config testnet sign-with-keychain send
 ```
 
-### Run End-to-End Test
+### 2. Start Oracle Node
 
 ```bash
-cd scripts
-npm install
-./test_real_mpc_e2e.sh
+cd oracle-node && npm install
+ORACLE_ACCOUNT_ID="lc.kaiyang.testnet" \
+ORACLE_PRIVATE_KEY="ed25519:..." \
+ORACLE_CONTRACT_ID="lc.kaiyang.testnet" \
+ORDERBOOK_CONTRACT_ID="ob.kaiyang.testnet" \
+NEAR_RPC_URL="https://test.rpc.fastnear.com" \
+ETH_RPC_URL="https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY" \
+SUI_RPC_URL="https://fullnode.testnet.sui.io:443" \
+ORACLE_REQUEST_API_ENABLED=true \
+npm start
 ```
 
-This will:
-1. Derive MPC ETH addresses for the contract and users
-2. Credit internal balances for both users
-3. Create swap intents (SOL <-> ETH)
-4. Batch match and trigger MPC signing
-5. Parse MPC signatures from NEAR transaction logs
-6. Assemble and broadcast a real ETH transaction on Sepolia
-7. Verify transition completion
+### 3. Start Frontend
 
-### Run Unit Tests
+```bash
+cd frontend && npm install && npm run dev
+# Open http://localhost:5173
+```
+
+### 4. Run Unit Tests
 
 ```bash
 cargo test
@@ -192,108 +179,21 @@ cargo test
 
 ---
 
-## Contract API Reference
+## Testnet Deployment
 
-### Write Methods
-
-| Method | Description | Deposit Required |
-|--------|-------------|-----------------|
-| `deposit_for(user, asset, amount)` | Admin credits user balance | No |
-| `verify_mpc_deposit(user, chain_type, asset, amount, recipient, memo, proof_data)` | Verify external deposit via light client | No |
-| `make_intent(src_asset, src_amount, dst_asset, dst_amount)` | Create a swap intent | No |
-| `take_intent(intent_id, amount)` | Take an open intent (single taker) | No |
-| `batch_match_intents(matches)` | Batch match + auto MPC sign | Yes (for MPC gas) |
-| `retry_settlement(sub_intent_id, payload, path, chain_type)` | Retry failed MPC signing | Yes |
-| `submit_payment_proof(...)` | Full ZK proof path (future use) | Yes |
-| `verify_transition_completion(sub_intent_id, proof_data, recipient, tx_hash)` | Verify outbound transfer completed | No |
-| `withdraw(asset, amount, payload, path, chain_type)` | Withdraw balance via MPC | Yes |
-
-### View Methods
-
-| Method | Description |
-|--------|-------------|
-| `get_intent(id)` | Get intent by ID |
-| `get_sub_intent(id)` | Get sub-intent by ID |
-| `get_transition_expectation(id)` | Get pending transition expectation |
-| `get_open_intents(from_index, limit)` | List open intents (paginated) |
-| `get_balance(user, asset)` | Get user's internal balance for an asset |
+| Component | Account / URL |
+|-----------|--------------|
+| Orderbook Contract | `ob.kaiyang.testnet` |
+| Oracle Contract | `lc.kaiyang.testnet` |
+| MPC Signer | `v1.signer-prod.testnet` |
+| User A | `kaiyang.testnet` |
+| User B | `shangguan.testnet` |
+| Oracle API | `http://127.0.0.1:8787` |
+| Frontend | `http://localhost:5173` |
 
 ---
 
-## Current Status
+## Documentation
 
-### Completed
-
-- [x] Orderbook smart contract with full intent lifecycle
-- [x] Batch matching with solvency validation and price fairness checks
-- [x] Automatic MPC signing via NEAR Chain Signatures (`v1.signer-prod.testnet`)
-- [x] ETH transaction building, signing, and broadcasting (Sepolia testnet)
-- [x] MPC address derivation (ETH) using `derived_public_key` contract method
-- [x] SOL address derivation via `chainsig.js`
-- [x] Withdrawal with automatic refund on MPC failure
-- [x] 44 comprehensive unit tests
-- [x] End-to-end test on real NEAR testnet with real MPC signatures
-- [x] Successfully broadcast MPC-signed ETH transfer on Sepolia
-
-### TODO
-
-- [ ] **Light Client — Real Proof Verification**
-  - Current light client is a skeleton that checks proof structure but does not perform cryptographic verification
-  - **ETH**: Implement header sync + receipt trie Merkle inclusion proof (similar to Rainbow Bridge)
-  - **SOL**: Implement slot commitment sync + transaction inclusion proof
-  - **BTC**: Implement SPV header chain + Merkle proof for transaction inclusion
-  - Consider integrating existing solutions: [Rainbow Bridge](https://github.com/aurora-is-near/rainbow-bridge) for ETH, or ZK light clients for better efficiency
-
-- [ ] **Solana Transaction Support**
-  - Build `sol_tx_helper.js` for constructing and broadcasting Solana transactions
-  - Handle Ed25519 signature scheme differences (Solana uses Ed25519, not secp256k1)
-  - Test real MPC-signed SOL transfers on Devnet
-
-- [ ] **BTC Transaction Support**
-  - Build BTC transaction construction using `omni-transaction-rs` or similar
-  - Handle UTXO model differences
-  - Test on Bitcoin Testnet
-
-- [ ] **Production Relayer**
-  - Current `mpc-relayer` only does mirror matching (exact symmetric amounts)
-  - Implement partial fill matching and multi-asset ring matching
-  - Add EVENT_JSON monitoring to auto-broadcast signed transactions
-  - Add retry logic for failed broadcasts
-
-- [ ] **Frontend / SDK**
-  - Web interface for creating and viewing intents
-  - SDK for programmatic intent creation and MPC withdrawal
-
-- [ ] **Security Hardening**
-  - Audit MPC deposit flow (ensure proofs cannot be replayed)
-  - Add nonce tracking for external-chain transactions
-  - Rate limiting and access control for batch matching
-  - Upgrade `deposit_for` to require proof-based deposits only
-
----
-
-## Key Concepts
-
-### NEAR Chain Signatures (MPC)
-
-NEAR's MPC network (`v1.signer-prod.testnet`) allows any NEAR account to request ECDSA signatures for external chains without holding private keys. The signature is derived from:
-
-- **Predecessor account ID**: The NEAR account calling `sign()`
-- **Derivation path**: A string like `"eth/1"` or `"solana-1"`
-- **Master key**: The MPC network's shared secret
-
-This means:
-- The **orderbook contract** can sign transactions from its pool address (for outbound transfers after matching)
-- **Users** can sign transactions from their personal MPC addresses (for withdrawals)
-- **No single entity holds any private key** — signatures require MPC consensus
-
-### Intent-Based Trading
-
-Unlike traditional AMM or order book models, this system uses **intents**:
-
-1. Users express *what they want* (e.g., "sell 1 SOL for 0.01 ETH")
-2. A solver finds matching counter-intents and submits a batch
-3. The contract validates fairness and triggers atomic settlement
-4. External-chain transfers happen via MPC signatures
-
-This allows **cross-chain swaps without bridges or wrapped tokens**.
+- **[TECHNICAL_DESCRIPTION.md](./TECHNICAL_DESCRIPTION.md)** — Comprehensive technical documentation covering architecture, data structures, operational flows, security model, and API reference
+- **[RUNBOOK.md](./RUNBOOK.md)** — Step-by-step CLI guide for the complete swap lifecycle

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { useWallet } from "../WalletContext";
-import { CONTRACT_ID, NODE_URL } from "../config";
+import { CONTRACT_ID, ORACLE_REVIEW_API_URL } from "../config";
 import {
   deriveMpcAddress,
   getEthBalance,
@@ -10,16 +10,19 @@ import {
   buildEthTxPayload,
   buildAvaxTxPayload,
   buildSuiTxPayload,
-  broadcastEvmTx,
-  broadcastSuiTx,
   type MpcAddress,
-  type SignatureEvent,
 } from "../mpc";
 import type { Intent } from "../types";
 import { statusLabel } from "../types";
 
 const CHAINS = ["ETH", "SUI", "AVAX"] as const;
 type Chain = (typeof CHAINS)[number];
+const DEMO_ORACLE_REFRESH_EVENT = "demo-oracle-refresh";
+
+function fixedPath(chain: Chain, accountId: string | null): string {
+  if (!accountId) return "";
+  return `${chain.toLowerCase()}/${accountId}`;
+}
 
 function toSmallestUnit(amount: string, chain: Chain): string {
   const n = parseFloat(amount);
@@ -34,26 +37,75 @@ const CHAIN_META: Record<Chain, { icon: string; color: string }> = {
   AVAX: { icon: "▲", color: "text-red-400" },
 };
 
+interface DepositEvent {
+  user: string;
+  asset: string;
+  amount: string | number;
+  tx_hash: string;
+  timestamp: string | number;
+}
+
+function formatScaledAmount(value: bigint, decimals: number, keep: number): string {
+  const base = 10n ** BigInt(decimals);
+  const whole = value / base;
+  const frac = value % base;
+  const fracRaw = frac.toString().padStart(decimals, "0").slice(0, keep).replace(/0+$/, "");
+  return fracRaw ? `${whole.toString()}.${fracRaw}` : whole.toString();
+}
+
+function formatDepositAmount(amount: string | number, asset: string): string {
+  let raw: bigint;
+  try {
+    raw = BigInt(amount);
+  } catch {
+    return `${amount} ${asset}`;
+  }
+  if (asset === "SUI") return `${formatScaledAmount(raw, 9, 4)} SUI`;
+  if (asset === "ETH" || asset === "AVAX") return `${formatScaledAmount(raw, 18, 6)} ${asset}`;
+  return `${raw.toString()} ${asset}`;
+}
+
+function formatTimestampNs(timestamp: string | number): string {
+  try {
+    const ms = Number(BigInt(timestamp) / 1_000_000n);
+    return new Date(ms).toLocaleString();
+  } catch {
+    return "-";
+  }
+}
+
+function shortHash(hash: string): string {
+  if (!hash) return "-";
+  if (hash.length <= 18) return hash;
+  return `${hash.slice(0, 10)}...${hash.slice(-8)}`;
+}
+
+function explorerTxUrl(asset: string, txHash: string): string {
+  if (asset === "SUI") return `https://suiscan.xyz/testnet/tx/${txHash}`;
+  if (asset === "AVAX") return `https://testnet.snowtrace.io/tx/${txHash}`;
+  return `https://sepolia.etherscan.io/tx/${txHash}`;
+}
+
 export default function UserPanel() {
   const { accountId, signIn, signOut, callMethod, viewMethod } = useWallet();
 
   // --- MPC balance lookup ---
   const [lookupChain, setLookupChain] = useState<Chain>("ETH");
-  const [lookupPath, setLookupPath] = useState("");
   const [lookupResult, setLookupResult] = useState<{
     addr: MpcAddress;
     balance: string;
   } | null>(null);
   const [lookupLoading, setLookupLoading] = useState(false);
   const [lookupError, setLookupError] = useState("");
+  const lookupPath = fixedPath(lookupChain, accountId);
 
-  const handleLookup = async () => {
-    if (!lookupPath.trim() || !accountId) return;
+  const handleLookup = useCallback(async () => {
+    if (!accountId) return;
     setLookupLoading(true);
     setLookupError("");
     setLookupResult(null);
     try {
-      const addr = await deriveMpcAddress(accountId, lookupPath, lookupChain);
+      const addr = await deriveMpcAddress(CONTRACT_ID, lookupPath, lookupChain);
       const balance = lookupChain === "SUI"
         ? await getSuiBalance(addr.address)
         : lookupChain === "AVAX"
@@ -61,19 +113,26 @@ export default function UserPanel() {
           : await getEthBalance(addr.address);
       setLookupResult({ addr, balance });
     } catch (e) {
-      setLookupError((e as Error).message);
+      const msg = (e as Error).message || "Unknown error";
+      if (msg.toLowerCase().includes("failed to fetch")) {
+        setLookupError("RPC network unavailable. Please retry in a few seconds.");
+      } else {
+        setLookupError(msg);
+      }
     } finally {
       setLookupLoading(false);
     }
-  };
+  }, [accountId, lookupPath, lookupChain]);
+
+  useEffect(() => {
+    handleLookup();
+  }, [handleLookup]);
 
   // --- Lock & Create Intent ---
   const [sellChain, setSellChain] = useState<Chain>("ETH");
   const [buyChain, setBuyChain] = useState<Chain>("SUI");
   const [sellAmount, setSellAmount] = useState("");
   const [buyAmount, setBuyAmount] = useState("");
-  const [sellPath, setSellPath] = useState("");
-  const [buyPath, setBuyPath] = useState("");
   const [expiresMin, setExpiresMin] = useState("30");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
@@ -82,15 +141,10 @@ export default function UserPanel() {
   const [depositInfo, setDepositInfo] = useState<{
     sourceAddr: string;
     sourceBalance: string;
+    sourceChain: Chain;
   } | null>(null);
-
-  useEffect(() => {
-    if (accountId) setSellPath(`${sellChain.toLowerCase()}/${accountId}`);
-  }, [accountId, sellChain]);
-
-  useEffect(() => {
-    if (accountId) setBuyPath(`${buyChain.toLowerCase()}/${accountId}`);
-  }, [accountId, buyChain]);
+  const sellPath = fixedPath(sellChain, accountId);
+  const buyPath = fixedPath(buyChain, accountId);
 
   useEffect(() => {
     if (sellChain === buyChain) {
@@ -99,13 +153,16 @@ export default function UserPanel() {
   }, [sellChain, buyChain]);
 
   const swapChains = () => {
-    const tmpC = sellChain, tmpA = sellAmount, tmpP = sellPath;
-    setSellChain(buyChain); setSellAmount(buyAmount); setSellPath(buyPath);
-    setBuyChain(tmpC); setBuyAmount(tmpA); setBuyPath(tmpP);
+    const tmpC = sellChain;
+    const tmpA = sellAmount;
+    setSellChain(buyChain);
+    setSellAmount(buyAmount);
+    setBuyChain(tmpC);
+    setBuyAmount(tmpA);
   };
 
   const handlePrepareDeposit = async () => {
-    if (!sellPath.trim()) return;
+    if (!accountId) return;
     setDepositLoading(true);
     setDepositError("");
     setDepositInfo(null);
@@ -115,7 +172,7 @@ export default function UserPanel() {
         sellChain === "SUI" ? await getSuiBalance(source.address)
         : sellChain === "AVAX" ? await getAvaxBalance(source.address)
         : await getEthBalance(source.address);
-      setDepositInfo({ sourceAddr: source.address, sourceBalance });
+      setDepositInfo({ sourceAddr: source.address, sourceBalance, sourceChain: sellChain });
     } catch (e) {
       setDepositError((e as Error).message);
     } finally {
@@ -127,21 +184,20 @@ export default function UserPanel() {
     if (!depositInfo) return;
     const refresh = async () => {
       try {
+        const chain = depositInfo.sourceChain;
         const bal =
-          sellChain === "SUI" ? await getSuiBalance(depositInfo.sourceAddr)
-          : sellChain === "AVAX" ? await getAvaxBalance(depositInfo.sourceAddr)
+          chain === "SUI" ? await getSuiBalance(depositInfo.sourceAddr)
+          : chain === "AVAX" ? await getAvaxBalance(depositInfo.sourceAddr)
           : await getEthBalance(depositInfo.sourceAddr);
         setDepositInfo((p) => (p ? { ...p, sourceBalance: bal } : p));
       } catch { /* ignore */ }
     };
-    const iv = setInterval(refresh, 15_000);
+    const iv = setInterval(refresh, 60_000);
     return () => clearInterval(iv);
-  }, [depositInfo?.sourceAddr, sellChain]);
+  }, [depositInfo?.sourceAddr, depositInfo?.sourceChain]);
 
   const handleCreateIntent = async () => {
     if (!accountId || !sellAmount || !buyAmount) return;
-    if (!sellPath.trim() || !buyPath.trim()) { setStatus("Fill in both paths"); return; }
-    if (!sellPath.includes(accountId)) { setStatus(`Source path must include ${accountId}`); return; }
     const sellWei = toSmallestUnit(sellAmount, sellChain);
     const buyWei = toSmallestUnit(buyAmount, buyChain);
     if (sellWei === "0" || buyWei === "0") { setStatus("Amount must be > 0"); return; }
@@ -149,7 +205,7 @@ export default function UserPanel() {
     setStatus("Building lock payload…");
     try {
       const { txPayload, dstAddress } = await prepareLockPayload(
-        accountId, sellChain, sellWei, buyChain, sellPath, buyPath,
+        sellChain, sellWei, buyChain, sellPath, buyPath,
       );
       setStatus("Opening MyNearWallet…");
       const expiresNs = Number(expiresMin) > 0 ? (Date.now() + Number(expiresMin) * 60_000) * 1_000_000 : 0;
@@ -183,7 +239,7 @@ export default function UserPanel() {
 
   useEffect(() => {
     fetchMyIntents();
-    const iv = setInterval(fetchMyIntents, 10_000);
+    const iv = setInterval(fetchMyIntents, 60_000);
     return () => clearInterval(iv);
   }, [fetchMyIntents]);
 
@@ -205,18 +261,14 @@ export default function UserPanel() {
   const [wdChain, setWdChain] = useState<Chain>("ETH");
   const [wdAmount, setWdAmount] = useState("");
   const [wdWalletAddr, setWdWalletAddr] = useState("");
-  const [wdPath, setWdPath] = useState("");
   const [wdStatus, setWdStatus] = useState("");
   const [wdBusy, setWdBusy] = useState(false);
   const [wdMpcAddr, setWdMpcAddr] = useState("");
   const [wdMpcBal, setWdMpcBal] = useState("");
-
-  useEffect(() => {
-    if (accountId) setWdPath(`${wdChain.toLowerCase()}/${accountId}`);
-  }, [accountId, wdChain]);
+  const wdPath = fixedPath(wdChain, accountId);
 
   const handleWdLookup = async () => {
-    if (!wdPath.trim()) return;
+    if (!accountId) return;
     try {
       const addr = await deriveMpcAddress(CONTRACT_ID, wdPath, wdChain);
       setWdMpcAddr(addr.address);
@@ -232,10 +284,6 @@ export default function UserPanel() {
 
   const handleWithdraw = async () => {
     if (!accountId || !wdWalletAddr.trim() || !wdAmount.trim()) return;
-    if (!wdPath.includes(accountId)) {
-      setWdStatus("Path must contain your account ID");
-      return;
-    }
     setWdBusy(true);
     setWdStatus("Building withdrawal tx…");
     try {
@@ -251,18 +299,23 @@ export default function UserPanel() {
         txPayload = await buildEthTxPayload(mpcAddr.address, wdWalletAddr, amountSmall, wdPath);
       }
 
-      // Save unsigned tx to localStorage for broadcast after wallet redirect
-      localStorage.setItem("withdraw_unsigned_tx", JSON.stringify(txPayload));
+      const unsignedTxHex = txPayload.unsignedTxHex
+        ?? (txPayload.unsignedTxBytes
+          ? txPayload.unsignedTxBytes.map((b: number) => b.toString(16).padStart(2, "0")).join("")
+          : "");
 
       setWdStatus("Signing via MPC (MyNearWallet)…");
       await callMethod("withdraw_from_mpc", {
         chain: wdChain,
         sign_scheme: txPayload.signScheme,
         path: wdPath,
+        to_address: wdWalletAddr,
+        amount: amountSmall,
+        unsigned_tx: unsignedTxHex,
         payload: txPayload.payload,
         ...(txPayload.eddsaPayload ? { eddsa_payload: txPayload.eddsaPayload } : {}),
       }, "100000000000000000000000", "300000000000000");
-      setWdStatus("MPC signed! Paste NEAR tx hash below to broadcast.");
+      setWdStatus("Submitted! Relayer will broadcast automatically.");
     } catch (e) {
       setWdStatus("Failed: " + (e as Error).message);
     } finally {
@@ -270,63 +323,82 @@ export default function UserPanel() {
     }
   };
 
-  // --- Broadcast withdrawal ---
-  const [wdTxHash, setWdTxHash] = useState("");
-  const [wdBroadcastStatus, setWdBroadcastStatus] = useState("");
+  // (Oracle auto-credits deposits — no manual confirm needed)
 
-  const handleWdBroadcast = async () => {
-    const hash = wdTxHash.trim();
-    if (!hash) return;
-    setWdBroadcastStatus("Scanning NEAR tx for signature…");
+  // --- Deposit Events (Oracle-confirmed history) ---
+  const [depositEvents, setDepositEvents] = useState<DepositEvent[]>([]);
+  const [depositEventsLoading, setDepositEventsLoading] = useState(false);
+  const [oracleBusy, setOracleBusy] = useState(false);
+  const [oracleStatus, setOracleStatus] = useState("");
+  const [reviewTxHash, setReviewTxHash] = useState("");
+
+  const fetchDepositEvents = useCallback(async () => {
+    if (!accountId) return;
+    setDepositEventsLoading(true);
     try {
-      const resp = await fetch(NODE_URL, {
+      const events = await viewMethod<DepositEvent[]>("get_deposit_events", { limit: 50 });
+      const mine = (events ?? [])
+        .filter((e) => e.user === accountId)
+        .reverse();
+      setDepositEvents(mine);
+    } catch {
+      setDepositEvents([]);
+    } finally {
+      setDepositEventsLoading(false);
+    }
+  }, [accountId, viewMethod]);
+
+  useEffect(() => {
+    fetchDepositEvents();
+    const iv = setInterval(fetchDepositEvents, 60_000);
+    return () => clearInterval(iv);
+  }, [fetchDepositEvents]);
+
+  const handleDemoOracleVerify = async () => {
+    if (!accountId) return;
+    if (!reviewTxHash.trim()) {
+      setOracleStatus("Please paste the deposit tx hash first.");
+      return;
+    }
+    if (!depositInfo?.sourceAddr || !sellPath.trim()) {
+      setOracleStatus("Please click Get Deposit Address first.");
+      return;
+    }
+    setOracleBusy(true);
+    setOracleStatus("Review request submitted, oracle is verifying on-chain tx…");
+    try {
+      const payload = {
+        chain: depositInfo.sourceChain,
+        tx_hash: reviewTxHash.trim(),
+        near_user: accountId,
+        path: sellPath,
+      };
+      const resp = await fetch(`${ORACLE_REVIEW_API_URL}/review`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0", id: "wd",
-          method: "EXPERIMENTAL_tx_status",
-          params: { tx_hash: hash, sender_account_id: accountId, wait_until: "EXECUTED_OPTIMISTIC" },
-        }),
-      }).then((r) => r.json());
-
-      let sig: SignatureEvent | null = null;
-      for (const ro of resp.result?.receipts_outcome ?? []) {
-        for (const log of ro.outcome?.logs ?? []) {
-          if (log.includes("EVENT_JSON:")) {
-            try {
-              sig = JSON.parse(log.split("EVENT_JSON:")[1]) as SignatureEvent;
-            } catch { /* skip */ }
-          }
-        }
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
       }
-      if (!sig) { setWdBroadcastStatus("No signature found in tx"); return; }
-
-      const savedRaw = localStorage.getItem("withdraw_unsigned_tx");
-      if (!savedRaw) { setWdBroadcastStatus("No saved unsigned tx. Re-do the withdraw."); return; }
-      const txPayload = JSON.parse(savedRaw);
-
-      setWdBroadcastStatus(`Broadcasting to ${sig.chain}…`);
-      let externalHash: string;
-      if (sig.sign_scheme === "EDDSA" && txPayload.unsignedTxBytes) {
-        externalHash = await broadcastSuiTx(txPayload.unsignedTxBytes, sig, txPayload.path);
-      } else if (txPayload.unsignedTxHex) {
-        externalHash = await broadcastEvmTx(txPayload.unsignedTxHex, sig);
+      const r = data.result || {};
+      if (r.status === "already_verified") {
+        setOracleStatus("Transaction already verified, refreshing data…");
       } else {
-        setWdBroadcastStatus("Missing unsigned tx data"); return;
+        setOracleStatus(`Review passed, attestation submitted: ${shortHash(r.tx_hash || reviewTxHash.trim())}`);
       }
 
-      localStorage.removeItem("withdraw_unsigned_tx");
-      const explorerUrl =
-        sig.chain === "SUI" ? `https://suiscan.xyz/testnet/tx/${externalHash}`
-        : sig.chain === "AVAX" ? `https://testnet.snowtrace.io/tx/${externalHash}`
-        : `https://sepolia.etherscan.io/tx/${externalHash}`;
-      setWdBroadcastStatus(`Done! ${externalHash}`);
-      setWdTxHash("");
-      window.open(explorerUrl, "_blank");
+      await Promise.all([fetchDepositEvents(), fetchMyIntents()]);
+      window.dispatchEvent(new Event(DEMO_ORACLE_REFRESH_EVENT));
+      setOracleStatus("Done: Deposit events and internal ledger refreshed.");
     } catch (e) {
-      setWdBroadcastStatus("Broadcast failed: " + (e as Error).message);
+      setOracleStatus(`Oracle verification failed: ${(e as Error).message}`);
+    } finally {
+      setOracleBusy(false);
     }
   };
+
 
   // ─── Render ────────────────────────────────────────────────────
   if (!accountId) {
@@ -355,7 +427,7 @@ export default function UserPanel() {
       {/* MPC Wallet Lookup */}
       <div className="rounded-xl border border-gray-700/50 bg-gray-800/40 p-3 space-y-2">
         <div className="flex items-center justify-between">
-          <span className="text-xs font-medium text-gray-400">MPC Wallet</span>
+          <span className="text-xs font-medium text-gray-400">MPC Wallet (Contract Namespace)</span>
           <div className="flex gap-1">
             {CHAINS.map((c) => (
               <button key={c} onClick={() => setLookupChain(c)}
@@ -366,13 +438,17 @@ export default function UserPanel() {
           </div>
         </div>
         <div className="flex gap-1.5">
-          <input type="text" value={lookupPath} onChange={(e) => setLookupPath(e.target.value)}
-            className="flex-1 bg-gray-900/60 text-white text-[11px] font-mono rounded-lg px-2.5 py-1.5 border border-gray-700/50 focus:border-indigo-500/50 outline-none transition" />
-          <button onClick={handleLookup} disabled={lookupLoading}
-            className="px-3 py-1.5 bg-indigo-600/80 hover:bg-indigo-500 disabled:opacity-40 rounded-lg text-white text-[11px] font-medium transition">
-            {lookupLoading ? "…" : "Query"}
-          </button>
+          <input
+            type="text"
+            value={lookupPath}
+            readOnly
+            className="w-full bg-gray-900/60 text-white/80 text-[11px] font-mono rounded-lg px-2.5 py-1.5 border border-gray-700/50 outline-none"
+          />
         </div>
+        <p className="text-[10px] text-gray-600">
+          Fixed path per chain: <span className="font-mono">{lookupPath || "-"}</span> (derived from your account).
+        </p>
+        {lookupLoading && !lookupResult && <p className="text-[11px] text-gray-500">Loading…</p>}
         {lookupError && <p className="text-[11px] text-red-400">{lookupError}</p>}
         {lookupResult && (
           <div className="rounded-lg bg-gray-900/60 p-2.5 space-y-1 border border-gray-700/30">
@@ -383,6 +459,51 @@ export default function UserPanel() {
             <p className="text-[10px] text-gray-500 font-mono break-all cursor-pointer hover:text-gray-300 transition" onClick={() => navigator.clipboard.writeText(lookupResult.addr.address)}>
               {lookupResult.addr.address}
             </p>
+          </div>
+        )}
+      </div>
+
+      {/* ═══ Deposit Events ═══ */}
+      <div className="rounded-xl border border-gray-700/50 bg-gray-800/40 p-3 space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium text-gray-400">Deposit Events</span>
+          <button onClick={fetchDepositEvents} className="text-[10px] text-indigo-400 hover:text-indigo-300 transition">Refresh</button>
+        </div>
+        <p className="text-[10px] text-gray-600">Recent Oracle-confirmed deposits for this account.</p>
+        {depositEventsLoading && depositEvents.length === 0 ? (
+          <p className="text-[11px] text-gray-500">Loading…</p>
+        ) : depositEvents.length === 0 ? (
+          <p className="text-[11px] text-gray-500">No deposit events yet.</p>
+        ) : (
+          <div className="space-y-1.5 max-h-[170px] overflow-y-auto">
+            {depositEvents.map((e, idx) => {
+              const chain = e.asset as Chain;
+              const meta = CHAIN_META[chain];
+              return (
+                <div key={`${e.tx_hash}-${idx}`} className="rounded-lg bg-gray-900/60 p-2 border border-gray-700/30">
+                  <div className="flex items-center justify-between">
+                    <span className={`text-[11px] font-medium ${meta?.color ?? "text-gray-300"}`}>
+                      {meta?.icon ?? "•"} {e.asset}
+                    </span>
+                    <span className="text-[11px] text-white font-mono">
+                      {formatDepositAmount(e.amount, e.asset)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between mt-1 gap-2">
+                    <span className="text-[10px] text-gray-600">{formatTimestampNs(e.timestamp)}</span>
+                    <a
+                      href={explorerTxUrl(e.asset, e.tx_hash)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-[10px] text-indigo-400 hover:text-indigo-300 font-mono underline"
+                      title={e.tx_hash}
+                    >
+                      {shortHash(e.tx_hash)}
+                    </a>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -402,6 +523,7 @@ export default function UserPanel() {
             </button>
           </div>
           <p className="text-[10px] text-gray-600">Send {sellChain} from your external wallet to this address first.</p>
+          <p className="text-[10px] text-gray-600">Anyone can request review; oracle-node verifies the tx and attests on-chain.</p>
           {depositError && <p className="text-[11px] text-red-400">{depositError}</p>}
           {depositInfo && (
             <div className="space-y-2">
@@ -412,6 +534,25 @@ export default function UserPanel() {
                 <span>Balance: <span className="text-gray-300 font-mono">{depositInfo.sourceBalance}</span></span>
                 <button onClick={handlePrepareDeposit} className="text-indigo-400 hover:text-indigo-300 underline transition">Refresh</button>
               </div>
+              <input
+                type="text"
+                value={reviewTxHash}
+                onChange={(e) => setReviewTxHash(e.target.value)}
+                placeholder={`Paste ${depositInfo.sourceChain} deposit tx hash`}
+                className="w-full bg-gray-900/60 text-gray-200 text-[11px] font-mono rounded-md px-2.5 py-1.5 border border-gray-700/50 focus:border-emerald-500/50 outline-none transition"
+              />
+              <button
+                onClick={handleDemoOracleVerify}
+                disabled={oracleBusy || !reviewTxHash.trim()}
+                className="w-full py-1.5 text-[11px] bg-emerald-600/80 hover:bg-emerald-500 disabled:opacity-40 rounded-md text-white transition"
+              >
+                {oracleBusy ? "Reviewing…" : "Request Oracle Review"}
+              </button>
+              {oracleStatus && (
+                <p className={`text-[10px] ${oracleStatus.includes("failed") ? "text-red-400" : "text-emerald-400"}`}>
+                  {oracleStatus}
+                </p>
+              )}
             </div>
           )}
         </div>
@@ -429,8 +570,12 @@ export default function UserPanel() {
           </div>
           <div className="flex items-center gap-1.5">
             <span className="text-[10px] text-gray-600 shrink-0">source path</span>
-            <input type="text" value={sellPath} onChange={(e) => setSellPath(e.target.value)}
-              className="flex-1 bg-gray-800/60 text-gray-300 text-[11px] font-mono rounded-md px-2 py-1 border border-gray-700/40 focus:border-indigo-500/40 outline-none transition" />
+            <input
+              type="text"
+              value={sellPath}
+              readOnly
+              className="flex-1 bg-gray-800/60 text-gray-400 text-[11px] font-mono rounded-md px-2 py-1 border border-gray-700/40 outline-none"
+            />
           </div>
           {sellAmount && <p className="text-[10px] text-gray-600 font-mono">= {toSmallestUnit(sellAmount, sellChain)} {sellChain === "SUI" ? "mist" : "wei"}</p>}
         </div>
@@ -453,8 +598,12 @@ export default function UserPanel() {
           </div>
           <div className="flex items-center gap-1.5">
             <span className="text-[10px] text-gray-600 shrink-0">destination path</span>
-            <input type="text" value={buyPath} onChange={(e) => setBuyPath(e.target.value)}
-              className="flex-1 bg-gray-800/60 text-gray-300 text-[11px] font-mono rounded-md px-2 py-1 border border-gray-700/40 focus:border-indigo-500/40 outline-none transition" />
+            <input
+              type="text"
+              value={buyPath}
+              readOnly
+              className="flex-1 bg-gray-800/60 text-gray-400 text-[11px] font-mono rounded-md px-2 py-1 border border-gray-700/40 outline-none"
+            />
           </div>
           {buyAmount && <p className="text-[10px] text-gray-600 font-mono">= {toSmallestUnit(buyAmount, buyChain)} {buyChain === "SUI" ? "mist" : "wei"}</p>}
         </div>
@@ -523,8 +672,12 @@ export default function UserPanel() {
 
         {/* MPC source info */}
         <div className="flex gap-1.5">
-          <input type="text" value={wdPath} onChange={(e) => setWdPath(e.target.value)} placeholder="eth/kaiyang.testnet"
-            className="flex-1 bg-gray-900/60 text-gray-300 text-[11px] font-mono rounded-lg px-2.5 py-1.5 border border-gray-700/50 focus:border-indigo-500/50 outline-none transition" />
+          <input
+            type="text"
+            value={wdPath}
+            readOnly
+            className="flex-1 bg-gray-900/60 text-gray-400 text-[11px] font-mono rounded-lg px-2.5 py-1.5 border border-gray-700/50 outline-none"
+          />
           <button onClick={handleWdLookup} className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-lg text-white text-[11px] transition">Check</button>
         </div>
         {wdMpcAddr && (
@@ -546,21 +699,9 @@ export default function UserPanel() {
           </button>
         </div>
 
-        {/* Broadcast after wallet redirect */}
-        <div className="space-y-1.5 border-t border-gray-700/30 pt-2">
-          <p className="text-[10px] text-gray-600">After MPC signs, paste the NEAR tx hash to broadcast:</p>
-          <div className="flex gap-1.5">
-            <input type="text" value={wdTxHash} onChange={(e) => setWdTxHash(e.target.value)} placeholder="NEAR tx hash…"
-              className="flex-1 bg-gray-900/60 text-gray-300 text-[11px] font-mono rounded-lg px-2.5 py-1.5 border border-gray-700/50 focus:border-indigo-500/50 outline-none transition" />
-            <button onClick={handleWdBroadcast} disabled={!wdTxHash.trim()}
-              className="px-3 py-1.5 bg-green-600/80 hover:bg-green-500 disabled:opacity-40 rounded-lg text-white text-[11px] transition">
-              Broadcast
-            </button>
-          </div>
-        </div>
+        <p className="text-[10px] text-gray-600 border-t border-gray-700/30 pt-2">After MPC signs, the Relayer will broadcast automatically.</p>
 
-        {wdStatus && <p className={`text-[10px] break-all ${wdStatus.includes("fail") || wdStatus.includes("Failed") ? "text-red-400" : wdStatus.includes("Done") ? "text-green-400" : "text-orange-400"}`}>{wdStatus}</p>}
-        {wdBroadcastStatus && <p className={`text-[10px] break-all ${wdBroadcastStatus.includes("fail") || wdBroadcastStatus.includes("Failed") ? "text-red-400" : wdBroadcastStatus.includes("Done") ? "text-green-400" : "text-indigo-400"}`}>{wdBroadcastStatus}</p>}
+        {wdStatus && <p className={`text-[10px] break-all ${wdStatus.includes("fail") || wdStatus.includes("Failed") ? "text-red-400" : wdStatus.includes("Submitted") ? "text-green-400" : "text-orange-400"}`}>{wdStatus}</p>}
       </div>
     </div>
   );

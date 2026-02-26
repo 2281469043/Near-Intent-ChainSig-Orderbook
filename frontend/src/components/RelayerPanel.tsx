@@ -7,7 +7,7 @@ import {
   type TxPayload,
   type SignatureEvent,
 } from "../mpc";
-import { NODE_URL } from "../config";
+import { NEAR_RPC_URLS } from "../config";
 import type { Intent } from "../types";
 
 type Chain = "ETH" | "SUI" | "AVAX";
@@ -76,7 +76,7 @@ export default function RelayerPanel() {
 
   useEffect(() => {
     fetchIntents();
-    const iv = setInterval(fetchIntents, 10_000);
+    const iv = setInterval(fetchIntents, 60_000);
     return () => clearInterval(iv);
   }, [fetchIntents]);
 
@@ -185,23 +185,30 @@ export default function RelayerPanel() {
 
   // ─── Step 2: Scan TX for signatures ────────────────────────────
   async function fetchSignaturesFromTx(txHash: string): Promise<SignatureEvent[]> {
-    const resp = await fetch(NODE_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: "sig",
-        method: "EXPERIMENTAL_tx_status",
-        params: {
-          tx_hash: txHash,
-          sender_account_id: accountId,
-          wait_until: "EXECUTED_OPTIMISTIC",
-        },
-      }),
-    }).then((r) => r.json());
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let resp: any;
+    for (const rpcUrl of NEAR_RPC_URLS) {
+      try {
+        resp = await fetch(rpcUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: "sig",
+            method: "EXPERIMENTAL_tx_status",
+            params: {
+              tx_hash: txHash,
+              sender_account_id: accountId,
+              wait_until: "EXECUTED_OPTIMISTIC",
+            },
+          }),
+        }).then((r) => r.json());
+        if (resp?.result) break;
+      } catch { /* try next */ }
+    }
 
     const sigs: SignatureEvent[] = [];
-    for (const ro of resp.result?.receipts_outcome ?? []) {
+    for (const ro of resp?.result?.receipts_outcome ?? []) {
       for (const log of ro.outcome?.logs ?? []) {
         if (log.includes("EVENT_JSON:")) {
           try {

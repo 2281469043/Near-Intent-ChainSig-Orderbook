@@ -5,6 +5,15 @@ import { deriveMpcAddress, getAvaxBalance, getEthBalance, getSuiBalance } from "
 import type { Intent } from "../types";
 import { statusLabel } from "../types";
 
+const TRACKED_USERS = [
+  "kaiyang.testnet",
+  "shangguan.testnet",
+  "ob.kaiyang.testnet",
+  "lc.kaiyang.testnet",
+];
+const LEDGER_ASSETS = ["ETH", "SUI", "AVAX"] as const;
+const DEMO_ORACLE_REFRESH_EVENT = "demo-oracle-refresh";
+
 function formatHuman(raw: string | number, asset: string): string {
   const n = Number(raw);
   if (n === 0) return "0";
@@ -23,11 +32,22 @@ const STATUS_COLORS: Record<string, string> = {
   Cancelled: "bg-gray-500/15 text-gray-500 border-gray-500/20",
 };
 
+interface DepositEvent {
+  user: string;
+  asset: string;
+  amount: number;
+  tx_hash: string;
+  timestamp: number;
+}
+
 export default function OrderBook() {
   const { accountId, viewMethod, callMethod } = useWallet();
   const [intents, setIntents] = useState<Intent[]>([]);
   const [loading, setLoading] = useState(false);
   const [balances, setBalances] = useState<Record<string, string>>({});
+  const [ledger, setLedger] = useState<Record<string, Record<string, string>>>({});
+  const [ledgerLoading, setLedgerLoading] = useState(false);
+  const [depositEvents, setDepositEvents] = useState<DepositEvent[]>([]);
   const [poolInfo, setPoolInfo] = useState<{
     ethAddr: string;
     ethBalance: string;
@@ -72,6 +92,27 @@ export default function OrderBook() {
     setBalances(result);
   }, [accountId, viewMethod]);
 
+  const fetchLedger = useCallback(async () => {
+    setLedgerLoading(true);
+    try {
+      const rows: Record<string, Record<string, string>> = {};
+      for (const user of TRACKED_USERS) {
+        rows[user] = {};
+        for (const asset of LEDGER_ASSETS) {
+          try {
+            const bal = await viewMethod<string>("get_balance", { user, asset });
+            rows[user][asset] = bal || "0";
+          } catch {
+            rows[user][asset] = "0";
+          }
+        }
+      }
+      setLedger(rows);
+    } finally {
+      setLedgerLoading(false);
+    }
+  }, [viewMethod]);
+
   const fetchPoolInfo = useCallback(async () => {
     try {
       const [eth, sui, avax] = await Promise.all([
@@ -97,17 +138,38 @@ export default function OrderBook() {
     }
   }, []);
 
+  const fetchDepositEvents = useCallback(async () => {
+    try {
+      const events = await viewMethod<DepositEvent[]>("get_deposit_events", { limit: 20 });
+      setDepositEvents(events.reverse());
+    } catch { /* ignore */ }
+  }, [viewMethod]);
+
   useEffect(() => {
     fetchIntents();
     fetchBalances();
+    fetchLedger();
     fetchPoolInfo();
+    fetchDepositEvents();
     const iv = setInterval(() => {
       fetchIntents();
       fetchBalances();
+      fetchLedger();
       fetchPoolInfo();
-    }, 8_000);
+      fetchDepositEvents();
+    }, 60_000);
     return () => clearInterval(iv);
-  }, [fetchIntents, fetchBalances, fetchPoolInfo]);
+  }, [fetchIntents, fetchBalances, fetchLedger, fetchPoolInfo, fetchDepositEvents]);
+
+  useEffect(() => {
+    const onRefresh = () => {
+      fetchBalances();
+      fetchLedger();
+      fetchDepositEvents();
+    };
+    window.addEventListener(DEMO_ORACLE_REFRESH_EVENT, onRefresh);
+    return () => window.removeEventListener(DEMO_ORACLE_REFRESH_EVENT, onRefresh);
+  }, [fetchBalances, fetchLedger, fetchDepositEvents]);
 
   const hasBalances = Object.values(balances).some((v) => v && v !== "0");
 
@@ -189,6 +251,58 @@ export default function OrderBook() {
         >
           ↻ Refresh
         </button>
+      </div>
+
+      {/* Internal Ledger */}
+      <div className="border-b border-gray-700/30 bg-gray-900/30">
+        <div className="flex items-center justify-between px-5 py-2">
+          <span className="text-[11px] text-gray-400">Orderbook Internal Ledger (Tracked Users)</span>
+          <button
+            onClick={fetchLedger}
+            className="text-[10px] text-indigo-400/70 hover:text-indigo-300 transition"
+          >
+            ↻
+          </button>
+        </div>
+        <div className="max-h-[170px] overflow-y-auto">
+          <table className="w-full text-[11px]">
+            <thead className="sticky top-0 bg-gray-900/95 text-[10px] text-gray-500 uppercase tracking-wider">
+              <tr>
+                <th className="text-left px-4 py-1.5 font-medium">User</th>
+                <th className="text-right px-2 py-1.5 font-medium">ETH</th>
+                <th className="text-right px-2 py-1.5 font-medium">SUI</th>
+                <th className="text-right px-4 py-1.5 font-medium">AVAX</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-800/30">
+              {TRACKED_USERS.map((user) => (
+                <tr key={user} className="hover:bg-gray-800/20 transition">
+                  <td className="px-4 py-1.5 text-gray-400 truncate max-w-[170px]" title={user}>
+                    {user}
+                  </td>
+                  {LEDGER_ASSETS.map((asset, idx) => (
+                    <td
+                      key={asset}
+                      className={`${idx === LEDGER_ASSETS.length - 1 ? "px-4" : "px-2"} py-1.5 text-right font-mono text-white`}
+                    >
+                      {formatHuman(ledger[user]?.[asset] || "0", asset)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+              {!ledgerLoading && Object.keys(ledger).length === 0 && (
+                <tr>
+                  <td className="px-4 py-2 text-gray-600" colSpan={4}>No ledger rows</td>
+                </tr>
+              )}
+              {ledgerLoading && (
+                <tr>
+                  <td className="px-4 py-2 text-gray-600" colSpan={4}>Loading ledger…</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       {/* Table */}
@@ -282,6 +396,54 @@ export default function OrderBook() {
           </table>
         )}
       </div>
+
+      {/* ═══ Oracle Deposit Verifications ═══ */}
+      {depositEvents.length > 0 && (
+        <div className="border-t border-gray-700/40">
+          <div className="flex items-center justify-between px-5 py-2.5">
+            <div className="flex items-center gap-2">
+              <span className="inline-block w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+              <span className="text-[11px] font-medium text-gray-400">Oracle Verified Deposits</span>
+              <span className="text-[10px] text-gray-600 bg-gray-800/60 px-1.5 py-0.5 rounded">{depositEvents.length}</span>
+            </div>
+            <button onClick={fetchDepositEvents} className="text-[10px] text-indigo-400/70 hover:text-indigo-300 transition">↻</button>
+          </div>
+          <div className="max-h-[200px] overflow-y-auto">
+            <table className="w-full text-[11px]">
+              <thead className="sticky top-0 bg-gray-900/95 text-[10px] text-gray-500 uppercase tracking-wider">
+                <tr>
+                  <th className="text-left px-4 py-1.5 font-medium">User</th>
+                  <th className="text-left px-2 py-1.5 font-medium">Asset</th>
+                  <th className="text-right px-2 py-1.5 font-medium">Amount</th>
+                  <th className="text-left px-2 py-1.5 font-medium">Tx Hash</th>
+                  <th className="text-right px-4 py-1.5 font-medium">Time</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-800/30">
+                {depositEvents.map((ev, idx) => (
+                  <tr key={idx} className="hover:bg-green-900/10 transition">
+                    <td className="px-4 py-1.5 text-gray-400 truncate max-w-[100px]" title={ev.user}>
+                      {ev.user.length > 14 ? ev.user.slice(0, 6) + "…" + ev.user.slice(-6) : ev.user}
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <span className="text-green-400 font-medium">{ev.asset}</span>
+                    </td>
+                    <td className="px-2 py-1.5 text-right font-mono text-white">
+                      {formatHuman(ev.amount, ev.asset)}
+                    </td>
+                    <td className="px-2 py-1.5 font-mono text-gray-500 truncate max-w-[140px]" title={ev.tx_hash}>
+                      {ev.tx_hash.slice(0, 10)}…{ev.tx_hash.slice(-6)}
+                    </td>
+                    <td className="px-4 py-1.5 text-right text-gray-600">
+                      {ev.timestamp > 0 ? new Date(ev.timestamp / 1e6).toLocaleTimeString() : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,628 +1,1673 @@
 # Cross-Chain Intent-Based Orderbook with NEAR Chain Signatures
 
-## 1. System Overview
+## Technical Description
 
-This system implements a trustless, cross-chain asset exchange protocol built on the NEAR blockchain. It enables users holding assets on different external blockchains (e.g., Ethereum, Solana, Bitcoin) to swap them without relying on centralized bridges, custodians, or liquidity providers. The core mechanism combines an **intent-based orderbook** with **NEAR Chain Signatures (MPC)** for cross-chain transaction signing, and a **Light Client** for on-chain proof verification.
+> **Version:** 1.0 — Last updated February 2026
+>
+> A trustless, cross-chain intent-based orderbook built on NEAR Protocol. Users on Ethereum Sepolia, SUI Testnet, and Avalanche Fuji can swap native assets without bridges, wrapped tokens, or centralized custody — powered by **NEAR Chain Signatures (MPC)**, **multi-oracle deposit attestation**, and an **intent-matching relayer**.
 
-### 1.1 Core Idea
+---
 
-Users express trading intentions ("I want to sell X amount of asset A for Y amount of asset B") by posting **Intents** to a smart contract on NEAR. When a compatible set of Intents is found (two or more Intents whose supplies and demands balance), they are atomically matched. The contract then leverages NEAR's MPC network to sign the required external-chain transactions, enabling asset transfers across chains without any single party holding custody of user funds.
+## Table of Contents
 
-### 1.2 Key Properties
+1. [Project Overview](#1-project-overview)
+2. [System Architecture](#2-system-architecture)
+3. [On-Chain Contracts](#3-on-chain-contracts)
+   - 3.1 [Orderbook Contract](#31-orderbook-contract)
+   - 3.2 [Oracle / Light Client Contract](#32-oracle--light-client-contract)
+   - 3.3 [NEAR MPC Signer](#33-near-mpc-signer)
+4. [Off-Chain Components](#4-off-chain-components)
+   - 4.1 [Oracle Node](#41-oracle-node)
+   - 4.2 [Relayer](#42-relayer)
+   - 4.3 [Frontend](#43-frontend)
+   - 4.4 [Scripts](#44-scripts)
+5. [Core Flows](#5-core-flows)
+   - 5.1 [Deposit + Oracle Verification](#51-flow-1-deposit--oracle-verification)
+   - 5.2 [Intent Creation (lock_and_make_intent)](#52-flow-2-intent-creation-lock_and_make_intent)
+   - 5.3 [Matching + Settlement](#53-flow-3-matching--settlement)
+   - 5.4 [Withdrawal](#54-flow-4-withdrawal)
+6. [MPC Address Derivation](#6-mpc-address-derivation)
+7. [Security Model](#7-security-model)
+8. [Contract API Reference](#8-contract-api-reference)
+   - 8.1 [Orderbook Contract Methods](#81-orderbook-contract-methods)
+   - 8.2 [Oracle Contract Methods](#82-oracle-contract-methods)
+9. [Data Structures](#9-data-structures)
+10. [Configuration & Environment](#10-configuration--environment)
+11. [Testnet Deployment](#11-testnet-deployment)
+12. [File Structure](#12-file-structure)
+13. [Dependencies & Build](#13-dependencies--build)
 
-- **Trustless**: No centralized entity controls user funds. Assets are held in MPC-derived addresses whose signing authority is governed by the NEAR smart contract.
-- **Non-custodial**: The contract itself does not "hold" external-chain assets in a traditional sense. Instead, it controls MPC-derived addresses that can only produce valid signatures through on-chain contract logic.
-- **Multi-party**: Supports 2-party direct swaps, 3-party ring swaps, up to N-party ring swaps (capped at 6 per batch for gas efficiency).
-- **Partial fills**: An Intent can be partially filled across multiple matching rounds.
-- **Atomic settlement**: Within a single batch match, all balance updates and MPC sign requests are processed atomically on NEAR.
+---
+
+## 1. Project Overview
+
+This project implements a **cross-chain, intent-based orderbook** as an academic/demo system on NEAR Testnet. The core insight is that NEAR's Chain Signatures protocol enables a single smart contract to control addresses on multiple external blockchains without bridges or wrapped tokens.
+
+### Key Innovation
+
+Traditional cross-chain swaps require either:
+- **Bridges**: mint/burn wrapped tokens, introducing trust assumptions and attack surface.
+- **Atomic swaps**: HTLCs that are complex, slow, and limited to two parties.
+- **Central custodians**: introduce single points of failure.
+
+This system eliminates all three by combining:
+
+| Technology | Role |
+|---|---|
+| **NEAR Chain Signatures (MPC)** | The orderbook contract controls external-chain addresses via threshold ECDSA/EdDSA signatures. No private key is stored anywhere — a network of MPC nodes collaboratively sign. |
+| **Multi-Oracle Attestation** | Off-chain oracle nodes independently verify deposits on external chains, then attest on-chain. When enough oracles agree, the deposit is automatically credited. |
+| **Intent-Based Matching** | Users express *what they want to trade* (intents), and a relayer finds optimal matches. The relayer is untrusted — all signature and balance logic is on-chain. |
+
+### Supported Chains
+
+| Chain | Network | Native Asset | Signature Scheme | Address Derivation |
+|---|---|---|---|---|
+| Ethereum | Sepolia Testnet | ETH | ECDSA (secp256k1) | `keccak256(pubkey_XY)[-20:]` |
+| SUI | Testnet | SUI | EdDSA (ed25519) | `blake2b(0x00 \|\| pubkey_32)` |
+| Avalanche | Fuji Testnet | AVAX | ECDSA (secp256k1) | `keccak256(pubkey_XY)[-20:]` |
+
+### Trust Assumptions
+
+- NEAR Protocol consensus is honest.
+- The MPC signer network (v1.signer-prod.testnet) is live and non-colluding.
+- At least `threshold` (currently 1 for demo) oracle nodes are honest.
+- External chain RPCs return correct data (multi-RPC failover mitigates single-RPC issues).
 
 ---
 
 ## 2. System Architecture
 
-### 2.1 On-Chain Components (NEAR)
-
-#### 2.1.1 Orderbook Contract (`orderbook-contract`)
-
-The primary smart contract deployed on NEAR. It manages:
-
-- **User Balances**: A ledger (`UnorderedMap<AccountId, UnorderedMap<String, u128>>`) that tracks each user's deposited balance per asset. These are logical balances representing verified deposits to the contract's MPC custody addresses on external chains.
-- **Intents**: The order table (`UnorderedMap<u64, Intent>`). Each Intent records the maker, the asset being sold (`src_asset`, `src_amount`), the asset desired (`dst_asset`, `dst_amount`), and its current status.
-- **SubIntents**: Partial fulfillment records (`UnorderedMap<u64, SubIntent>`). When an Intent is (partially) matched, a SubIntent is created to track the lifecycle of that specific fill — including its MPC signing status and transition verification status.
-- **Transition Expectations**: Records (`UnorderedMap<u64, TransitionExpectation>`) of what the contract expects to see confirmed on external chains after a match. Used during the verification phase.
-- **Pending Withdrawals**: Records (`UnorderedMap<u64, PendingWithdrawal>`) of in-flight withdrawal requests, enabling automatic balance refund if the MPC signing step fails.
-
-**Contract State:**
-
 ```
-Orderbook {
-    owner: AccountId,
-    mpc_contract: AccountId,              // e.g., v1.signer-prod.testnet
-    light_client_contract: AccountId,     // e.g., lc.kaiyang.testnet
-    balances: Map<AccountId, Map<String, u128>>,
-    intents: Map<u64, Intent>,
-    sub_intents: Map<u64, SubIntent>,
-    transition_expectations: Map<u64, TransitionExpectation>,
-    pending_withdrawals: Map<u64, PendingWithdrawal>,
-    next_id: u64,                         // monotonically increasing ID counter
+┌──────────────────────────────────────────────────────────────────────┐
+│                         NEAR TESTNET                                 │
+│                                                                      │
+│  ┌─────────────────────┐  cross-call   ┌──────────────────────────┐ │
+│  │  Oracle Contract     │◄────────────►│  Orderbook Contract       │ │
+│  │  (lc.kaiyang.testnet)│  credit_     │  (ob.kaiyang.testnet)     │ │
+│  │                      │  deposit     │                            │ │
+│  │  • attest()          │              │  • balances                │ │
+│  │  • threshold check   │              │  • intents / sub_intents   │ │
+│  │  • multi-oracle      │              │  • lock_and_make_intent    │ │
+│  └──────────┬───────────┘              │  • batch_match_intents     │ │
+│             │                          │  • withdraw_from_mpc       │ │
+│             │                          └────────────┬───────────────┘ │
+│             │                                       │                 │
+│             │                          ┌────────────▼───────────────┐ │
+│             │                          │  MPC Signer Contract       │ │
+│             │                          │  (v1.signer-prod.testnet)  │ │
+│             │                          │                            │ │
+│             │                          │  • sign(request)           │ │
+│             │                          │  • derived_public_key()    │ │
+│             │                          └────────────────────────────┘ │
+└─────────────┼────────────────────────────────────────────────────────┘
+              │
+   ┌──────────┼────────────────────────────────────────────────┐
+   │  OFF-CHAIN COMPONENTS                                      │
+   │                                                            │
+   │  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐  │
+   │  │ Oracle Node  │   │   Relayer    │   │   Frontend   │  │
+   │  │              │   │              │   │   (React)    │  │
+   │  │ • verify tx  │   │ • poll       │   │              │  │
+   │  │ • attest()   │   │ • match      │   │ • wallet     │  │
+   │  │ • review API │   │ • build tx   │   │ • intents    │  │
+   │  │              │   │ • broadcast  │   │ • relay UI   │  │
+   │  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘  │
+   │         │                  │                   │          │
+   └─────────┼──────────────────┼───────────────────┼──────────┘
+             │                  │                   │
+   ┌─────────▼──────────────────▼───────────────────▼──────────┐
+   │           EXTERNAL BLOCKCHAINS                             │
+   │                                                            │
+   │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+   │  │ ETH Sepolia  │  │ SUI Testnet  │  │ AVAX Fuji    │    │
+   │  │ (EIP-1559)   │  │ (Ed25519)    │  │ (EIP-1559)   │    │
+   │  └──────────────┘  └──────────────┘  └──────────────┘    │
+   └────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow Summary
+
+1. **Deposit**: User sends funds on external chain → MPC-controlled address.
+2. **Verify**: Oracle node verifies the deposit → attests on NEAR → credits internal balance.
+3. **Intent**: User creates an intent (e.g., sell 0.01 ETH, buy 0.5 SUI).
+4. **Match**: Relayer finds compatible intents → builds unsigned settlement TXs → calls `batch_match_intents`.
+5. **Sign**: Contract auto-triggers MPC to sign each settlement TX.
+6. **Broadcast**: Relayer picks up MPC signatures → assembles signed TXs → broadcasts to external chains.
+
+---
+
+## 3. On-Chain Contracts
+
+### 3.1 Orderbook Contract
+
+**Account:** `ob.kaiyang.testnet`
+**Source:** `orderbook-contract/src/lib.rs` (1354 lines)
+**Language:** Rust (near-sdk)
+
+The orderbook contract is the central coordination layer. It manages:
+
+- **User balance ledger** — `UnorderedMap<AccountId, UnorderedMap<String, u128>>`: Each NEAR account maps to a set of asset balances (e.g., `kaiyang.testnet → { "ETH": 10000000000000000, "SUI": 500000000 }`).
+- **Intent lifecycle** — Create, fill, cancel, and track intents.
+- **MPC signing orchestration** — Automatically calls the MPC signer when a match is found or a withdrawal is requested.
+- **Withdrawal with auto-refund** — Deducts balance before MPC signing; if MPC fails, automatically refunds.
+- **Broadcast queue** — Stores signed transactions for the relayer to pick up and broadcast.
+
+#### Contract State
+
+```rust
+pub struct Orderbook {
+    pub owner: AccountId,
+    pub mpc_contract: AccountId,                                   // v1.signer-prod.testnet
+    pub light_client_contract: AccountId,                          // lc.kaiyang.testnet
+    pub balances: UnorderedMap<AccountId, UnorderedMap<String, u128>>,
+    pub intents: UnorderedMap<u64, Intent>,
+    pub sub_intents: UnorderedMap<u64, SubIntent>,
+    pub transition_expectations: UnorderedMap<u64, TransitionExpectation>,
+    pub pending_withdrawals: UnorderedMap<u64, PendingWithdrawal>,
+    pub next_id: u64,
+    pub open_intent_ids: UnorderedSet<u64>,                        // O(k) open intent queries
+    pub pair_index: UnorderedMap<String, Vec<u64>>,                // "ETH:SUI" → [id1, id2, ...]
+    pub verified_deposits: UnorderedSet<String>,                   // replay protection
+    pub deposit_events: Vec<DepositEvent>,                         // capped at 50 entries
+    pub operation_metas: UnorderedMap<u64, OperationMeta>,         // in-flight MPC ops
+    pub broadcast_queue: UnorderedMap<u64, BroadcastTask>,         // signed TXs awaiting broadcast
 }
 ```
 
-#### 2.1.2 Light Client Contract (`light-client`)
+All collection prefixes use the `v2:` namespace to avoid stale keys from earlier deployments.
 
-A separate NEAR smart contract responsible for verifying proofs of external-chain transactions. It exposes two verification methods:
+#### Cross-Contract Interfaces
 
-- `verify_payment_proof(chain_type, proof_data, expected_recipient, expected_asset, expected_amount, expected_memo) -> bool`  
-  Used to verify that a deposit transaction actually occurred on the external chain.
+The contract interacts with two external contracts:
 
-- `verify_transition_proof(chain_type, proof_data, expected_recipient, expected_asset, expected_amount, expected_memo, expected_tx_hash) -> bool`  
-  Used to verify that a post-match transfer transaction was confirmed on the external chain.
+```rust
+#[ext_contract(ext_signer)]
+pub trait MultiChainSigner {
+    fn sign(&mut self, request: SignRequest) -> Promise;
+}
 
-The Light Client maintains a `finalized_height` per chain. Proofs submitted with a `block_height` beyond the finalized height are rejected. In production, this contract would perform full cryptographic Merkle proof verification against actual chain headers. The current implementation performs structural and field validation as a framework for future full verification.
+#[ext_contract(ext_light_client)]
+pub trait LightClient {
+    fn verify_payment_proof(
+        &self, chain: String, proof_data: Vec<u8>,
+        expected_recipient: String, expected_asset: String,
+        expected_amount: U128, expected_memo: String,
+    ) -> bool;
+}
+```
 
-#### 2.1.3 NEAR MPC Signer Contract (`v1.signer-prod.testnet`)
+#### MPC Sign Request Format
 
-The NEAR Chain Signatures MPC contract, operated by the NEAR MPC network. It provides:
+```rust
+pub struct SignRequest {
+    pub payload_v2: PayloadV2,   // Ecdsa(hex) or Eddsa(hex)
+    pub path: String,             // e.g., "eth/kaiyang.testnet"
+    pub domain_id: u32,           // 0 = secp256k1, 1 = ed25519
+}
 
-- `sign(request: SignRequest) -> SignResult`: Accepts a 32-byte `payload` (the hash of the transaction to be signed), a `path` (derivation path string), and `key_version`. Returns an ECDSA signature `(big_r, s, recovery_id)` for secp256k1 chains, or an Ed25519 signature for Solana.
+pub enum PayloadV2 {
+    Ecdsa(String),   // keccak256 hash as hex
+    Eddsa(String),   // raw tx bytes as hex
+}
+```
 
-- `derived_public_key(predecessor, path) -> PublicKey`: A view method that returns the deterministically derived public key for a given `(predecessor_account_id, path)` pair.
+The `build_sign_request` helper routes ECDSA vs EdDSA based on `sign_scheme`:
+- **ECDSA** (`domain_id=0`): Wraps the 32-byte `payload` (keccak256 hash of unsigned EVM tx) as `PayloadV2::Ecdsa`.
+- **EdDSA** (`domain_id=1`): Wraps the raw `eddsa_payload` bytes (blake2b hash of SUI intent message) as `PayloadV2::Eddsa`. Validates payload length is 32–1232 bytes.
 
-**Address Derivation Formula:**
+#### MPC Signature Result Handling
+
+The MPC signer returns different formats depending on the signing scheme:
+
+```rust
+pub enum SignResult {
+    Ecdsa(EcdsaSignResult),           // {big_r: {affine_point}, s: {scalar}, recovery_id}
+    EddsaBytes(EddsaSignResultBytes), // {signature: [u8; 64]}
+    EddsaHex(EddsaSignResultHex),     // {scheme, signature: "hex_string"}
+    EddsaString(String),              // raw hex string fallback
+}
+```
+
+All variants are normalized into a unified `SignatureEvent` struct and emitted as `EVENT_JSON:` logs for the relayer to parse.
+
+### 3.2 Oracle / Light Client Contract
+
+**Account:** `lc.kaiyang.testnet`
+**Source:** `light-client/src/lib.rs` (224 lines)
+**Language:** Rust (near-sdk)
+
+The oracle contract implements a **multi-signature attestation system** for verifying external-chain deposits. It replaces a traditional light client with an oracle-based approach suitable for a demo/academic setting.
+
+#### Contract State
+
+```rust
+pub struct OracleContract {
+    pub owner: AccountId,
+    pub oracles: UnorderedSet<AccountId>,                    // registered oracle node accounts
+    pub threshold: u32,                                       // min attestations needed (currently 1)
+    pub orderbook_contract: AccountId,                        // cross-call target
+    pub attestations: LookupMap<String, DepositAttestation>,  // "ETH:0xabc..." → attestation
+    pub attestation_keys: UnorderedSet<String>,               // enumeration support
+}
+```
+
+#### Attestation Flow
+
+When an oracle node calls `attest(chain, tx_hash, recipient, sender, amount, near_user)`:
+
+1. **Authorization check**: Only accounts in `self.oracles` can call.
+2. **Key derivation**: Attestation key = `"{chain}:{tx_hash}"`.
+3. **Upsert attestation**: If first attestation for this key, create a new `DepositAttestation`; otherwise, verify that `recipient`, `amount`, and `near_user` match the existing record.
+4. **Record confirmation**: Add the calling oracle to `att.confirmations` (a `HashSet<AccountId>`).
+5. **Threshold check**: If `confirmations.len() >= threshold`:
+   - Mark `att.resolved = true`.
+   - Cross-contract call: `ext_orderbook.credit_deposit(user, chain, amount, tx_hash)`.
+6. **Sub-threshold**: Log `ATTESTATION:chain=...,tx_hash=...,oracle=...,count=N/M`.
+
+#### Legacy Interface
+
+For backward compatibility with the original light-client proof-based approach:
+
+```rust
+pub fn verify_payment_proof(
+    &self, chain: String, _proof_data: Vec<u8>,
+    _expected_recipient: String, _expected_asset: String,
+    expected_amount: U128, _expected_memo: String,
+) -> bool
+```
+
+This method checks if an attestation is resolved and the amount matches. The `_proof_data` is interpreted as a UTF-8 tx_hash string.
+
+### 3.3 NEAR MPC Signer
+
+**Account:** `v1.signer-prod.testnet`
+**Type:** External NEAR protocol infrastructure (not part of this codebase)
+
+The MPC signer implements threshold cryptography — a distributed key generation and signing protocol where no single node holds the full private key.
+
+#### Key Methods
+
+| Method | Description |
+|---|---|
+| `sign(request: SignRequest)` | Signs a payload using the MPC network. Returns ECDSA or EdDSA signature. |
+| `derived_public_key(predecessor, path, domain_id)` | Deterministically derives a public key from master key + predecessor + path. |
+
+#### Address Derivation Formula
 
 ```
-derived_key = KDF(master_public_key, predecessor_account_id, path)
-address = chain_specific_encoding(derived_key)
+derived_key = KDF(master_key, predecessor_account_id, path, domain_id)
 ```
 
 Where:
-- `predecessor_account_id` is the NEAR account calling `sign()` (i.e., the orderbook contract's account ID).
-- `path` is an arbitrary caller-chosen string (e.g., `"eth/pool"`, `"sol/user-alice"`).
-- The derived key is deterministic: the same `(predecessor, path)` always produces the same external-chain address.
-- For secp256k1 chains (ETH, BTC): the public key is derived on the secp256k1 curve, and the address is computed as `keccak256(uncompressed_pubkey)[12:]` (Ethereum) or via standard BTC address encoding.
-- For Ed25519 chains (SOL): the public key is derived on the Ed25519 curve, and the Solana address is the base58 encoding of the 32-byte public key.
+- `predecessor`: The NEAR account calling (or the designated contract, e.g., `ob.kaiyang.testnet`).
+- `path`: An arbitrary string that creates a unique derivation (e.g., `"eth/kaiyang.testnet"`).
+- `domain_id`: `0` for secp256k1 (ETH/AVAX), `1` for ed25519 (SUI).
 
-### 2.2 Off-Chain Components
-
-#### 2.2.1 Relayer / Matcher
-
-An off-chain service (or any user/bot) that:
-
-1. **Monitors** the orderbook contract for Open Intents (via `get_open_intents` view calls or event indexing).
-2. **Finds matching sets** of Intents whose asset supplies and demands balance.
-3. **Constructs unsigned external-chain transactions** for each Intent in the matched set (the "transition" transactions that will move assets between users' external addresses).
-4. **Computes the payload** (Keccak-256 or SHA-256 hash of each unsigned transaction's serialized form).
-5. **Submits the batch** to the contract via `batch_match_intents`, passing the matching parameters including payloads and derivation paths.
-6. **Listens for MPC signature events** emitted by the contract (`EVENT_JSON:{...}`).
-7. **Assembles signed transactions** by combining the unsigned transaction with the MPC-produced signature `(big_r, s, recovery_id)`.
-8. **Broadcasts** the fully signed transactions to the respective external-chain networks.
-9. **Waits for confirmations** on external chains.
-10. **Submits transition proofs** back to the contract via `verify_transition_completion` to finalize the SubIntents.
-
-The Relayer is **trustless** — it cannot tamper with transactions because the MPC signature is bound to a specific payload. Even if the Relayer is malicious or offline, anyone can read the signature events from NEAR and broadcast the transactions themselves.
-
-#### 2.2.2 Frontend / User Application
-
-A user-facing application that:
-
-1. Derives the contract's MPC deposit address for a given user and asset using the MPC contract's `derived_public_key` view method.
-2. Instructs the user to send funds to that address on the external chain, with a specific `memo` field for identification.
-3. Submits deposit verification requests to the orderbook contract.
-4. Allows users to create and manage Intents.
-5. Displays order book state, balances, and trade history.
+The same `(predecessor, path, domain_id)` always produces the same public key and thus the same external-chain address. Only the `predecessor` contract can request signatures for that derived key.
 
 ---
 
-## 3. Data Structures
+## 4. Off-Chain Components
 
-### 3.1 Intent
+### 4.1 Oracle Node
 
-```rust
-struct Intent {
-    id: u64,
-    maker: AccountId,        // NEAR account that created this Intent
-    src_asset: String,       // Asset being sold (e.g., "ETH", "SOL", "BTC")
-    src_amount: u128,        // Total amount to sell (in smallest unit)
-    filled_amount: u128,     // Amount already matched/filled
-    dst_asset: String,       // Asset desired in return
-    dst_amount: u128,        // Minimum amount desired for the full src_amount
-    status: IntentStatus,    // Open | Filled
+**Directory:** `oracle-node/`
+**Runtime:** Node.js
+**Entry point:** `src/index.js` (533 lines)
+
+The oracle node independently verifies deposits on external chains and submits attestations to the oracle contract on NEAR.
+
+#### Modules
+
+| File | Lines | Description |
+|---|---|---|
+| `src/index.js` | 533 | Main loop, review API server, chain scanning, attestation |
+| `src/near-client.js` | 87 | NEAR RPC client with multi-endpoint failover |
+| `src/address-resolver.js` | 119 | MPC address derivation (ETH/SUI/AVAX) |
+| `src/config.js` | 47 | Environment configuration loader |
+
+#### Operation Modes
+
+1. **Review API Mode** (`ORACLE_REQUEST_API_ENABLED=true`, default): Exposes an HTTP API at `POST /review` that accepts permissionless review requests. Anyone can submit a `{chain, tx_hash, near_user, path}` payload. The oracle independently verifies the transaction, then attests if valid.
+
+2. **Auto-Poll Mode** (`ORACLE_REQUEST_API_ENABLED=false`): Continuously polls:
+   - Open intents from the orderbook contract (to discover MPC deposit addresses).
+   - Local `watch-addresses.json` for manually configured addresses.
+   - External chains for incoming transactions to watched addresses.
+
+#### Review API (`POST /review`)
+
+**Endpoint:** `http://{host}:{port}/review`
+**CORS:** Configurable via `ORACLE_REQUEST_API_ALLOWED_ORIGIN` (default `*`).
+
+Request body:
+```json
+{
+  "chain": "ETH",
+  "tx_hash": "0xabc123...",
+  "near_user": "kaiyang.testnet",
+  "path": "eth/kaiyang.testnet"
 }
 ```
 
-**Status Transitions:**
-- `Open` → `Filled` (when `filled_amount == src_amount`)
-- `Open` remains `Open` if only partially filled (`filled_amount < src_amount`)
+Processing steps:
+1. **Normalize & validate** — Chain must be ETH/SUI/AVAX, path must match `{chain.lower()}/{near_user}`.
+2. **Cache check** — If the same request was processed within the last 60 seconds, return the cached result.
+3. **Derive recipient** — Call `deriveMpcAddress(orderbookContractId, path, chain)` to get the expected MPC address.
+4. **Check NEAR** — Call `lc.is_verified(chain, tx_hash)` to skip already-verified deposits.
+5. **Verify on external chain**:
+   - For EVM chains: `fetchEvmTxProof(chain, txHash, recipient)` — checks `eth_getTransactionByHash`, `eth_getTransactionReceipt`, block confirmations.
+   - For SUI: `fetchSuiTxProof(txHash, recipient)` — checks `sui_getTransactionBlock` with balance changes.
+6. **Attest** — Call `lc.attest(chain, tx_hash, recipient, sender, amount, near_user)` via a NEAR transaction.
 
-### 3.2 SubIntent
+#### EVM Transaction Verification (`fetchEvmTxProof`)
 
-```rust
-struct SubIntent {
-    id: u64,
-    parent_intent_id: u64,   // References the parent Intent
-    taker: AccountId,         // The account that called batch_match_intents
-    amount: u128,             // The fill amount for this particular match
-    status: IntentStatus,     // Verifying | Settled | Taken | TransitionVerifying | Completed
+```
+Input:  (chain, txHash, expectedRecipient)
+Output: { valid, recipient, sender, amount, reason? }
+```
+
+Verification checks:
+1. Transaction exists on chain (`eth_getTransactionByHash`).
+2. Transaction has a recipient (`tx.to` is not null — filters out contract creation).
+3. Recipient matches the expected MPC address (case-insensitive).
+4. Transfer amount is > 0.
+5. Transaction succeeded (`receipt.status === 1`).
+6. Sufficient block confirmations (ETH: 3, AVAX: 3, configurable).
+
+#### SUI Transaction Verification (`fetchSuiTxProof`)
+
+```
+Input:  (txHash, expectedRecipient)
+Output: { valid, recipient, sender, amount, reason? }
+```
+
+Verification checks:
+1. Transaction exists (`sui_getTransactionBlock` with `showEffects` and `showBalanceChanges`).
+2. Transaction status is "success".
+3. Balance changes contain a positive SUI deposit to the expected recipient address.
+4. Amount > 0.
+
+#### NEAR Client (`near-client.js`)
+
+Multi-RPC failover implementation:
+
+```javascript
+let connections = [];  // [{conn, account, url}]
+let primaryIdx = 0;
+
+async function withRetry(fn) {
+  for (let i = 0; i < connections.length; i++) {
+    const idx = (primaryIdx + i) % connections.length;
+    try {
+      const result = await fn(connections[idx].account);
+      if (i !== 0) primaryIdx = idx;  // promote successful endpoint
+      return result;
+    } catch (err) {
+      // try next endpoint
+    }
+  }
+  throw lastErr;
 }
 ```
 
-**Status Transitions:**
+The client uses `near-api-js` v5 with `InMemoryKeyStore`. Key can be provided via `ORACLE_PRIVATE_KEY` env var or loaded from `~/.near-credentials`.
+
+#### Address Resolver (`address-resolver.js`)
+
+Implements two derivation paths:
+
+**EVM (ETH/AVAX):**
+1. Call `derived_public_key({predecessor, path, domain_id: 0})` on MPC contract.
+2. Parse base58-encoded secp256k1 public key (strip `"secp256k1:"` prefix).
+3. Handle three formats: 64 bytes (raw XY), 65 bytes (0x04 + XY), 33 bytes (compressed).
+4. For compressed keys: decompress using the secp256k1 curve equation `y² = x³ + 7 mod p`.
+5. `address = "0x" + keccak256(XY_64_bytes).slice(-40)`.
+
+**SUI:**
+1. Call `derived_public_key({predecessor, path, domain_id: 1})` on MPC contract.
+2. Parse base58-encoded ed25519 public key (strip `"ed25519:"` prefix).
+3. `address = "0x" + blake2b(0x00 || pubkey_32_bytes, outputLen=32).hex()`.
+
+### 4.2 Relayer
+
+**Directory:** `relayer/`
+**Runtime:** Node.js
+**Entry point:** `src/index.js` (573 lines)
+
+The relayer is a stateless off-chain service that automates the cross-chain swap lifecycle.
+
+#### Modules
+
+| File | Lines | Description |
+|---|---|---|
+| `src/index.js` | 573 | Main orchestration loop (7 phases) |
+| `src/matcher.js` | 311 | Pair matching + ring matching algorithms |
+| `src/eth-utils.js` | 213 | ETH address derivation, TX build/sign/broadcast |
+| `src/sui-utils.js` | 196 | SUI address derivation, TX build/sign/broadcast |
+| `src/near-client.js` | — | NEAR RPC client |
+| `src/config.js` | 75 | Configuration |
+
+#### Main Loop
+
+Each cycle runs through:
+
 ```
-Verifying → Settled           (MPC sign succeeded)
-Verifying → Taken             (MPC sign failed; can retry)
-Taken → Verifying             (retry_settlement called)
-Settled → TransitionVerifying (verify_transition_completion called)
-TransitionVerifying → Completed   (Light Client proof verified)
-TransitionVerifying → Settled     (Light Client proof failed; can retry)
+Phase A: Process broadcast queue (MPC-signed withdraw txs)
+Phase 1: Poll open intents from orderbook contract
+Phase 2: Run matching engine (pair + ring matching)
+Phase 3: Build unsigned external-chain transactions
+Phase 4: Submit batch_match_intents to NEAR
+Phase 5: Parse MPC signature events from NEAR tx receipts
+Phase 6: Assemble signed transactions + broadcast to external chains
+Phase 7: (Legacy) Transition proof verification
 ```
 
-### 3.3 MatchParams
+#### Matching Engine (`matcher.js`)
 
-```rust
-struct MatchParams {
-    intent_id: U128,
-    fill_amount: U128,             // How much of this Intent to fill
-    get_amount: U128,              // How much the maker receives
-    payload: [u8; 32],             // Keccak-256 hash of the unsigned external-chain tx
-    path: String,                  // MPC derivation path for signing
-    transition_chain_type: ChainType,  // Target chain (ETH | SOL | BTC)
+The matcher implements two algorithms:
+
+**Pairwise Matching:**
+- For each pair of intents `(A, B)` where `A.src_asset == B.dst_asset` AND `A.dst_asset == B.src_asset`:
+- Compute fill amounts respecting remaining capacity and minimum price ratios.
+- Price check: `get_amount / fill_amount >= dst_amount / src_amount` for both sides.
+- Mark matched intents as used to avoid double-matching.
+
+**Ring Matching (3–6 parties):**
+- Build a directed graph: `src_asset → dst_asset` edges per intent.
+- DFS cycle detection: find cycles of length 3–6 where asset flow forms a closed loop.
+- For a ring `[A(X→Y), B(Y→Z), C(Z→X)]`: chain exchange rates through the ring, find the bottleneck, scale all fills proportionally.
+- Verify solvency: for each asset, total supply ≥ total demand.
+
+```
+Priority: Pair matches run first. Remaining intents go to ring matching.
+Output:   Array of MatchGroups, each containing intents + fill amounts.
+```
+
+#### ETH Transaction Lifecycle (`eth-utils.js`)
+
+1. **Build**: Create EIP-1559 (Type 2) transaction: `gasLimit=21000`, fetch `nonce`/`feeData`/`chainId` from RPC.
+2. **Payload**: `keccak256(unsignedSerialized)` → 32-byte hash for MPC signing.
+3. **Assemble**: Attach MPC signature: parse `big_r` (strip compressed prefix → 32-byte x-coordinate), `s` (32 bytes), `recovery_id` (0 or 1). Build `ethers.Signature` with `v = recovery_id + 27`.
+4. **Broadcast**: `eth_sendRawTransaction` via ethers.js, wait for 1 confirmation.
+
+#### SUI Transaction Lifecycle (`sui-utils.js`)
+
+1. **Build**: Create a `splitCoins + transferObjects` transaction using `@mysten/sui/transactions`.
+2. **Digest**: Compute `blake2b(intentScope("TransactionData") || txBytes, 32)` — the 32-byte EdDSA payload.
+3. **Assemble**: Combine `flag(0x00) + signature(64 bytes) + pubkey(32 bytes)` → base64 SUI serialized signature.
+4. **Broadcast**: `client.executeTransactionBlock({ transactionBlock, signature })`.
+
+#### Broadcast Queue Processing
+
+The relayer polls `get_broadcast_queue()` from the orderbook contract. For each signed task:
+
+1. If ECDSA: assemble signed EVM tx → `eth_sendRawTransaction`.
+2. If EdDSA: derive MPC public key → assemble SUI signature → `executeTransactionBlock`.
+3. After successful broadcast: call `ack_broadcast(id)` to remove from queue.
+
+### 4.3 Frontend
+
+**Directory:** `frontend/`
+**Stack:** React 18 + TypeScript + Vite + Tailwind CSS
+
+#### Layout
+
+Three-panel grid layout (`grid-cols-[340px_1fr_340px]`):
+
+| Panel | Component | Role |
+|---|---|---|
+| Left (340px) | `UserPanel.tsx` | Wallet, MPC lookup, deposit, intent creation, withdrawal |
+| Center (flex) | `OrderBook.tsx` | Open intents table, internal ledger, deposit events, pool info |
+| Right (340px) | `RelayerPanel.tsx` | Select & match intents, scan signatures, broadcast |
+
+#### Wallet Connection (`WalletContext.tsx`)
+
+Uses `@near-wallet-selector/core` with `@near-wallet-selector/my-near-wallet` (popup mode).
+
+Provides:
+- `selector`: WalletSelector instance.
+- `accountId`: Currently connected NEAR account.
+- `signIn()` / `signOut()`: MyNearWallet authentication.
+- `viewMethod(method, args)`: Read-only contract calls with multi-RPC failover.
+- `callMethod(method, args, deposit, gas)`: Transaction calls via wallet popup.
+- `callMethodTo(receiverId, method, args, deposit, gas)`: Transaction to arbitrary receiver.
+
+Multi-RPC failover for view methods iterates through `NEAR_RPC_URLS`:
+```typescript
+for (const url of NEAR_RPC_URLS) {
+  try {
+    const provider = new providers.JsonRpcProvider({ url });
+    const res = await provider.query({ ... });
+    return JSON.parse(Buffer.from(res.result).toString());
+  } catch (err) { /* try next */ }
 }
 ```
 
-### 3.4 TransitionExpectation
+#### MPC Module (`mpc.ts`, 584 lines)
+
+Central module for all MPC-related operations:
+
+| Function | Description |
+|---|---|
+| `deriveMpcAddress(predecessor, path, chain)` | Derives external-chain address from MPC contract |
+| `getEthBalance(address)` | Queries ETH balance via `eth_getBalance` |
+| `getSuiBalance(address)` | Queries SUI balance via `suix_getBalance` |
+| `getAvaxBalance(address)` | Queries AVAX balance via `eth_getBalance` |
+| `buildEthTxPayload(from, to, amount, path)` | Builds unsigned EIP-1559 ETH transfer |
+| `buildAvaxTxPayload(from, to, amount, path)` | Builds unsigned EIP-1559 AVAX transfer |
+| `buildSuiTxPayload(from, to, amount, path)` | Builds unsigned SUI transfer + EdDSA digest |
+| `buildSettlementPayload(chain, srcPath, dstAddr, amount)` | Settlement TX for relayer matching |
+| `prepareLockPayload(sellChain, amount, buyChain, sellPath, buyPath)` | Atomic lock + intent TX |
+| `broadcastEvmTx(unsignedTxHex, sig)` | Assembles + broadcasts signed EVM tx |
+| `broadcastSuiTx(unsignedTxBytes, sig, signerPath)` | Assembles + broadcasts signed SUI tx |
+
+**ETH RPC Failover Stack:**
+```
+Primary:  Alchemy Sepolia
+Fallback: Tenderly → drpc → publicnode
+```
+
+All RPC calls use raw `fetch()` with JSON-RPC format and iterate through fallback URLs on failure.
+
+#### User Panel (`UserPanel.tsx`, 709 lines)
+
+Features:
+- **MPC Wallet Lookup**: Auto-queries on chain/account change. Fixed path pattern: `{chain.toLowerCase()}/{accountId}`.
+- **Deposit Address**: Derives the MPC address for the sell chain, shows address + balance, provides a copy button.
+- **Oracle Review**: Permissionless — user pastes external tx hash, frontend POSTs to oracle API.
+- **Lock & Create Intent**: Builds unsigned TX (user's MPC → pool MPC), then calls `lock_and_make_intent` via MyNearWallet.
+- **My Intents**: Lists the user's open intents with cancel buttons.
+- **Withdrawal**: Builds unsigned TX (user's MPC → user's external wallet), then calls `withdraw_from_mpc`.
+- **Deposit Events**: Shows oracle-confirmed deposits for the current account.
+
+#### OrderBook Panel (`OrderBook.tsx`, 450 lines)
+
+Displays:
+- **Locked Balance Bar**: Current user's internal balances in the contract.
+- **Pool MPC Info**: Pool addresses (eth/1, sui/1, avax/1) and their external-chain balances.
+- **Internal Ledger**: A table of tracked users' internal balances (kaiyang.testnet, shangguan.testnet, etc.).
+- **Open Intents Table**: ID, maker, src_path, sell/buy amounts, status.
+- **Deposit Events**: Global oracle-verified deposit history.
+
+#### Relayer Panel (`RelayerPanel.tsx`, 553 lines)
+
+Two-step process:
+
+**Step 1 — Select & Match:**
+1. Display open intents with checkboxes.
+2. "Build Payloads" → For each selected intent, build an unsigned settlement TX (from seller's MPC address to buyer's dst_address).
+3. Show unsigned TX details; save to `localStorage` (persists across MyNearWallet redirects).
+4. "Submit Match" → Call `batch_match_intents` with all `MatchParams`.
+
+**Step 2 — Broadcast:**
+1. Paste the NEAR transaction hash from MyNearWallet.
+2. "Scan" → Fetch `EXPERIMENTAL_tx_status`, parse `EVENT_JSON:` logs for `SignatureEvent`s.
+3. Match signatures to saved unsigned TXs.
+4. "Broadcast" or "Broadcast All" → Assemble signed TXs and broadcast to external chains.
+
+### 4.4 Scripts
+
+| Script | Description |
+|---|---|
+| `scripts/deploy_testnet.sh` | Full deployment pipeline: create accounts, build Rust WASM, deploy + initialize contracts |
+| `scripts/upgrade_oracle.sh` | Re-deploy oracle contract with state migration |
+| `scripts/derive_eth_address.js` | CLI tool to derive an ETH address from an MPC path |
+| `scripts/derive_sui_address.js` | CLI tool to derive a SUI address from an MPC path |
+| `scripts/eth_tx_helper.js` | CLI tool to build/broadcast ETH transactions |
+| `scripts/sui_tx_helper.js` | CLI tool to build/broadcast SUI transactions |
+
+---
+
+## 5. Core Flows
+
+### 5.1 Flow 1: Deposit + Oracle Verification
+
+This flow deposits external-chain assets into the orderbook's internal ledger.
+
+```
+ User (MetaMask)         Frontend           Oracle Node          NEAR Contracts
+      │                    │                    │                      │
+      │  1. Connect NEAR   │                    │                      │
+      │  wallet            │                    │                      │
+      │  (MyNearWallet)    │                    │                      │
+      │◄──────────────────►│                    │                      │
+      │                    │                    │                      │
+      │  2. Select sell    │ derive MPC addr    │                      │
+      │  chain (ETH)       │───────────────────►│                      │
+      │                    │   ob.kaiyang.testnet                      │
+      │                    │   path="eth/kaiyang.testnet"              │
+      │                    │   domain_id=0                             │
+      │                    │◄──────────────────────────────────────────│
+      │                    │   0xd0cd508...                            │
+      │                    │                    │                      │
+      │  3. Send ETH to    │                    │                      │
+      │  MPC address       │                    │                      │
+      │  (external wallet) │                    │                      │
+      │────────────────────┼────────────────────┼───────(ETH Sepolia)──│
+      │                    │                    │                      │
+      │  4. Paste tx_hash  │                    │                      │
+      │  in frontend       │                    │                      │
+      │───────────────────►│                    │                      │
+      │                    │  5. POST /review   │                      │
+      │                    │  {chain, tx_hash,  │                      │
+      │                    │   near_user, path} │                      │
+      │                    │───────────────────►│                      │
+      │                    │                    │  6a. Derive expected  │
+      │                    │                    │  MPC recipient addr   │
+      │                    │                    │                      │
+      │                    │                    │  6b. Check            │
+      │                    │                    │  is_verified()        │
+      │                    │                    │─────────────────────►│
+      │                    │                    │◄─────────────────────│
+      │                    │                    │                      │
+      │                    │                    │  6c. fetchEvmTxProof: │
+      │                    │                    │  - getTransaction     │
+      │                    │                    │  - getReceipt         │
+      │                    │                    │  - check confirmations│
+      │                    │                    │  - verify recipient   │
+      │                    │                    │  - verify amount > 0  │
+      │                    │                    │                      │
+      │                    │                    │  6d. attest()         │
+      │                    │                    │─────────────────────►│ Oracle Contract
+      │                    │                    │                      │
+      │                    │                    │  7. threshold met →   │
+      │                    │                    │  cross-call           │
+      │                    │                    │  credit_deposit()     │
+      │                    │                    │                ──────►│ Orderbook
+      │                    │                    │                      │
+      │                    │                    │                      │ 8. Credit
+      │                    │                    │                      │ user balance
+      │                    │                    │                      │ + record event
+      │                    │◄──────────────────────────────────────────│
+      │                    │  9. Refresh UI     │                      │
+```
+
+**Key details:**
+
+- The MPC address is derived using `predecessor = "ob.kaiyang.testnet"` (the contract), not the user's account. This ensures only the orderbook contract can sign for this address.
+- Path format: `{chain.toLowerCase()}/{accountId}` — e.g., `"eth/kaiyang.testnet"`.
+- The oracle review API is permissionless (anyone can request a review), but only registered oracle accounts can call `attest()` on the oracle contract.
+- Replay protection: `verified_deposits` set in the orderbook ensures the same `tx_hash` cannot be credited twice.
+- Deposit events are stored in a capped vector (max 50) for frontend querying.
+
+### 5.2 Flow 2: Intent Creation (`lock_and_make_intent`)
+
+This is an atomic operation that locks funds and creates an intent in one transaction.
+
+```
+ User                     Frontend                   NEAR Contracts
+  │                         │                              │
+  │  1. Fill form:          │                              │
+  │  sell 0.01 ETH          │                              │
+  │  buy 0.5 SUI            │                              │
+  │  expiry: 30 min         │                              │
+  │────────────────────────►│                              │
+  │                         │  2. prepareLockPayload():    │
+  │                         │  - Derive user sell addr     │
+  │                         │    (ob.kaiyang.testnet,      │
+  │                         │     "eth/kaiyang.testnet")   │
+  │                         │  - Derive pool addr          │
+  │                         │    (ob.kaiyang.testnet,      │
+  │                         │     "eth/1")                 │
+  │                         │  - Derive user buy addr      │
+  │                         │    (ob.kaiyang.testnet,      │
+  │                         │     "sui/kaiyang.testnet")   │
+  │                         │  - Build unsigned ETH tx:    │
+  │                         │    from=userSellAddr,        │
+  │                         │    to=poolAddr,              │
+  │                         │    value=0.01 ETH            │
+  │                         │  - Compute payload =         │
+  │                         │    keccak256(unsignedTx)     │
+  │                         │                              │
+  │  3. MyNearWallet popup  │  callMethod(                 │
+  │◄────────────────────────│    "lock_and_make_intent",   │
+  │                         │    { src_asset: "ETH",       │
+  │  4. User approves       │      src_amount: "10...",    │
+  │────────────────────────►│      dst_asset: "SUI",       │
+  │                         │      dst_amount: "500...",   │
+  │                         │      expires_at: ns_ts,      │
+  │                         │      dst_address: suiAddr,   │
+  │                         │      chain: "ETH",           │
+  │                         │      sign_scheme: "ECDSA",   │
+  │                         │      path: "eth/kai...",     │
+  │                         │      payload: [32 bytes],    │
+  │                         │    },                        │
+  │                         │    deposit=0.1 NEAR,         │
+  │                         │    gas=300 TGas              │
+  │                         │  )─────────────────────────►│
+  │                         │                              │
+  │                         │                              │ 5. Contract:
+  │                         │                              │ - Verify path contains caller
+  │                         │                              │ - Call MPC signer.sign()
+  │                         │                              │
+  │                         │                              │ 6. MPC callback (on_lock_signed):
+  │                         │                              │ - Credit internal balance
+  │                         │                              │ - Debit internal balance
+  │                         │                              │ - Create Intent (status: Open)
+  │                         │                              │ - Emit EVENT_JSON (signature)
+  │                         │                              │
+  │                         │◄─────────────────────────────│ "LockSuccess:intent_id=N"
+```
+
+**Key details:**
+
+- The 0.1 NEAR deposit is forwarded to the MPC signer as payment for the signing service.
+- 300 TGas is allocated: ~200 TGas for MPC signing + ~100 TGas for contract logic + callbacks.
+- `expires_at` is a nanosecond timestamp. Frontend computes: `(Date.now() + minutes * 60000) * 1_000_000`.
+- Path ownership check: `path.contains(caller.as_str())` ensures users can only lock from their own MPC addresses.
+- On MPC failure: the `on_lock_signed` callback logs `LOCK_FAILED` and the funds remain in the user's external wallet (no internal state change).
+
+### 5.3 Flow 3: Matching + Settlement
+
+The relayer (or a user via the RelayerPanel) orchestrates matching.
+
+```
+ Relayer/User              Frontend/Relayer              NEAR Contracts         External Chains
+      │                         │                              │                      │
+      │  1. Select intents      │                              │                      │
+      │  (e.g., #5 ETH→SUI,    │                              │                      │
+      │   #6 SUI→ETH)          │                              │                      │
+      │                         │  2. Build settlement TXs:    │                      │
+      │                         │  For intent #5 (ETH→SUI):    │                      │
+      │                         │    from = derive(ob.kai,      │                      │
+      │                         │           "eth/kaiyang.test") │                      │
+      │                         │    to   = #6.dst_address      │                      │
+      │                         │    amount = #5.remaining      │                      │
+      │                         │  For intent #6 (SUI→ETH):    │                      │
+      │                         │    from = derive(ob.kai,      │                      │
+      │                         │           "sui/shangguan...")  │                      │
+      │                         │    to   = #5.dst_address      │                      │
+      │                         │    amount = #6.remaining      │                      │
+      │                         │                              │                      │
+      │  3. Submit match        │  batch_match_intents(        │                      │
+      │                         │    matches: [                │                      │
+      │                         │      { intent_id: 5,         │                      │
+      │                         │        fill_amount, get_amt, │                      │
+      │                         │        payload: [32 bytes],  │                      │
+      │                         │        path, chain, scheme,  │                      │
+      │                         │        eddsa_payload? },     │                      │
+      │                         │      { intent_id: 6, ... }   │                      │
+      │                         │    ]                         │                      │
+      │                         │  )──────────────────────────►│                      │
+      │                         │                              │                      │
+      │                         │                              │ 4. For each match:   │
+      │                         │                              │ - Validate Open       │
+      │                         │                              │ - Check expiry        │
+      │                         │                              │ - Check fill amount   │
+      │                         │                              │ - Price fairness      │
+      │                         │                              │ - Track asset supply  │
+      │                         │                              │                      │
+      │                         │                              │ 5. Solvency check:   │
+      │                         │                              │ ∀ asset: supply ≥ 0  │
+      │                         │                              │                      │
+      │                         │                              │ 6. Create SubIntents  │
+      │                         │                              │ (status: Verifying)   │
+      │                         │                              │                      │
+      │                         │                              │ 7. Credit makers with │
+      │                         │                              │ buy-side amounts      │
+      │                         │                              │                      │
+      │                         │                              │ 8. MPC sign() ×N     │
+      │                         │                              │ (detached promises)   │
+      │                         │                              │                      │
+      │                         │                              │ 9. on_signed():       │
+      │                         │                              │ - SubIntent → Complete│
+      │                         │                              │ - Emit EVENT_JSON     │
+      │                         │                              │                      │
+      │  10. Scan NEAR tx       │◄─────────────────────────────│                      │
+      │  for EVENT_JSON logs    │                              │                      │
+      │                         │                              │                      │
+      │  11. Assemble signed    │                              │                      │
+      │  transactions           │                              │                      │
+      │                         │                              │                      │
+      │  12. Broadcast          │──────────────────────────────┼─────────────────────►│
+      │                         │  eth_sendRawTransaction      │                      │ ETH Sepolia
+      │                         │  sui_executeTransactionBlock │                      │ SUI Testnet
+```
+
+**Batch validation in the contract:**
+
+The contract enforces conservation of mass across the entire batch:
 
 ```rust
-struct TransitionExpectation {
-    sub_intent_id: u64,
-    chain_type: ChainType,
-    expected_asset: String,
-    expected_amount: u128,
-    expected_memo: String,         // Format: "transition:sub:{sub_intent_id}"
+let mut asset_balance: HashMap<String, i128> = HashMap::new();
+for m in &matches {
+    // Supply: intent's src_asset (released by filling)
+    asset_balance[src] += fill_amount;
+    // Demand: intent's dst_asset (consumed by get_amount)
+    asset_balance[dst] -= get_amount;
+}
+// Solvency check:
+for (asset, net) in asset_balance.iter() {
+    assert!(*net >= 0, "Insufficient supply for asset {}", asset);
 }
 ```
 
-### 3.5 SignatureEvent (emitted as NEAR log)
+Price fairness per intent:
+```
+lhs = get_amount × intent.src_amount
+rhs = fill_amount × intent.dst_amount
+assert(lhs >= rhs)  // maker gets at least their stated price
+```
+
+### 5.4 Flow 4: Withdrawal
+
+Users can withdraw from their MPC-controlled address to their personal external wallet.
+
+```
+ User                     Frontend                   NEAR Contracts
+  │                         │                              │
+  │  1. Enter destination   │                              │
+  │  wallet address +       │                              │
+  │  amount + chain         │                              │
+  │────────────────────────►│                              │
+  │                         │  2. deriveMpcAddress()       │
+  │                         │  → user's MPC address        │
+  │                         │                              │
+  │                         │  3. Build unsigned TX:        │
+  │                         │  from = user's MPC addr      │
+  │                         │  to   = user's wallet addr   │
+  │                         │  value = amount              │
+  │                         │                              │
+  │  4. MyNearWallet popup  │  callMethod(                 │
+  │◄────────────────────────│    "withdraw_from_mpc",      │
+  │                         │    { chain, sign_scheme,     │
+  │  5. User approves       │      path, to_address,      │
+  │────────────────────────►│      amount, unsigned_tx,    │
+  │                         │      payload, eddsa_payload  │
+  │                         │    })                        │
+  │                         │  )──────────────────────────►│
+  │                         │                              │
+  │                         │                              │ 6. Verify path ownership
+  │                         │                              │ 7. Store OperationMeta
+  │                         │                              │ 8. Call MPC signer.sign()
+  │                         │                              │
+  │                         │                              │ 9. on_signed():
+  │                         │                              │ - Emit EVENT_JSON
+  │                         │                              │ - Add to broadcast_queue
+  │                         │                              │
+  │                         │                              │ 10. Relayer picks up from
+  │                         │                              │ broadcast_queue, broadcasts,
+  │                         │                              │ then calls ack_broadcast()
+```
+
+**Key details:**
+
+- `withdraw_from_mpc` does NOT deduct internal balance — the funds are on the external chain.
+- Path ownership: `path.contains(caller.as_str())` prevents users from withdrawing others' funds.
+- `OperationMeta` stores the unsigned TX hex so the relayer can reconstruct the signed transaction.
+- After MPC signing, a `BroadcastTask` is added to the `broadcast_queue` for the relayer.
+
+The older `withdraw` method (which deducts internal balance) stores a `PendingWithdrawal` and auto-refunds on MPC failure:
 
 ```rust
-struct SignatureEvent {
-    sub_intent_id: u64,
-    chain_type: ChainType,
-    payload: String,               // Hex-encoded 32-byte payload
-    big_r: String,                 // MPC signature R component (affine point)
-    s: String,                     // MPC signature S component (scalar)
-    recovery_id: u8,               // ECDSA recovery ID (0 or 1)
-    transition_memo: String,
+Err(_) => {
+    if let Some(wd) = self.pending_withdrawals.get(&id) {
+        self.internal_transfer(wd.user.clone(), wd.asset.clone(), wd.amount);
+        self.pending_withdrawals.remove(&id);
+    }
 }
 ```
 
 ---
 
-## 4. Complete Operational Flow
+## 6. MPC Address Derivation
 
-### Phase 0: System Initialization
+### Deterministic Address Generation
 
-1. **Deploy Orderbook Contract** to NEAR.
-   - Transaction: `near contract deploy <orderbook_account> use-file <wasm_path>`
-   - Call `new(mpc_contract, light_client_contract)` to initialize.
-   - This sets the `owner`, and records references to the MPC signer contract and Light Client contract.
+Every external-chain address is deterministically derived from three parameters:
 
-2. **Deploy Light Client Contract** to NEAR.
-   - Transaction: `near contract deploy <lc_account> use-file <wasm_path>`
-   - Call `new()` to initialize.
-   - Call `set_finalized_height(chain_type, height)` for each supported chain to set the initial trusted block height.
+| Parameter | Value | Description |
+|---|---|---|
+| `predecessor` | `"ob.kaiyang.testnet"` | The NEAR contract that will sign for this address |
+| `path` | `"eth/kaiyang.testnet"` | Unique derivation path |
+| `domain_id` | `0` or `1` | `0` = secp256k1 (ETH/AVAX), `1` = ed25519 (SUI) |
 
-3. **Derive the contract's MPC pool address** for each supported chain.
-   - Call `derived_public_key` on the MPC contract (view call, no transaction):
-     ```
-     derived_public_key(predecessor: "<orderbook_account>", path: "<chain_path>")
-     ```
-   - Convert the returned public key to a chain-specific address:
-     - ETH: `keccak256(uncompressed_secp256k1_pubkey)[12:]` → `0x...` address
-     - SOL: `base58(ed25519_pubkey)` → Solana address
-     - BTC: Standard P2PKH or P2WPKH encoding
-   - These addresses are where users will deposit funds.
+The MPC signer's `derived_public_key` view method returns a base58-encoded public key.
 
-### Phase 1: Deposit
-
-**Goal:** User transfers assets from their external-chain wallet to the contract's MPC-derived custody address, then the contract verifies and credits the balance.
-
-**Step 1.1 — User sends external-chain transaction:**
-
-The user constructs and signs a standard transaction on the source chain using their own wallet:
-
-- **To:** The orderbook contract's MPC-derived address for the relevant chain/asset.
-- **Value/Amount:** The deposit amount.
-- **Data/Memo:** Must include the string `mpc:deposit:<user_near_account>:<asset>` for identification. On Ethereum, this is encoded in the transaction's `data` field. On Solana, in the memo instruction. On Bitcoin, in an OP_RETURN output.
-- **Signed by:** The user's own external-chain private key (standard wallet signing, not MPC).
-
-The user broadcasts this transaction to the external chain network and waits for confirmation.
-
-**Step 1.2 — Submit deposit proof to NEAR:**
-
-After the external-chain transaction is confirmed (sufficient block confirmations), the Relayer or the user submits a verification request to the orderbook contract:
-
-- **NEAR Transaction:** Call `verify_mpc_deposit` on the orderbook contract.
-- **Parameters:**
-  - `user`: The NEAR account ID of the depositor.
-  - `chain_type`: Which chain the deposit was made on (ETH, SOL, or BTC).
-  - `asset`: The asset identifier string (e.g., "ETH", "SOL").
-  - `amount`: The deposit amount in the chain's smallest unit (wei, lamports, satoshis).
-  - `recipient`: The MPC-derived address that received the deposit.
-  - `memo`: The memo string from the transaction (`mpc:deposit:<user>:<asset>`).
-  - `proof_data`: Chain-specific inclusion proof (Merkle proof, transaction receipt, etc.).
-
-**Step 1.3 — Contract verifies the deposit:**
-
-The orderbook contract:
-
-1. Asserts the memo matches the expected format `mpc:deposit:<user>:<asset>`.
-2. Makes a **cross-contract call** to the Light Client contract:
-   ```
-   ext_light_client::verify_payment_proof(chain_type, proof_data, recipient, asset, amount, memo)
-   ```
-3. The Light Client verifies:
-   - The `proof_data` is structurally valid.
-   - The `block_height` in the proof does not exceed the chain's `finalized_height`.
-   - The transaction fields (recipient, amount, asset, memo) match the expected values.
-   - (Production) The Merkle inclusion proof is cryptographically valid against the stored chain header.
-4. Returns `true` or `false`.
-
-**Step 1.4 — Balance credited (callback):**
-
-The orderbook contract's `on_mpc_deposit_verified` callback:
-
-- If `true`: Credits the user's internal balance: `balances[user][asset] += amount`.
-- If `false`: Panics with "MPC deposit proof invalid" — no balance change.
-- Emits log: `MPC_DEPOSIT_VERIFIED:user=...,asset=...,amount=...,recipient=...,memo=...`
-
-### Phase 2: Place Order (Make Intent)
-
-**Goal:** User publishes a trading intention to the orderbook.
-
-**Step 2.1 — User submits Intent:**
-
-- **NEAR Transaction:** Call `make_intent` on the orderbook contract.
-- **Caller:** The user's NEAR account.
-- **Parameters:**
-  - `src_asset`: The asset to sell (e.g., "ETH").
-  - `src_amount`: The amount to sell (in smallest unit).
-  - `dst_asset`: The asset to receive (e.g., "SOL").
-  - `dst_amount`: The minimum amount to receive for the full `src_amount` (defines the limit price).
-
-**Step 2.2 — Contract processes the Intent:**
-
-1. Verifies the user has sufficient internal balance: `balances[user][src_asset] >= src_amount`.
-2. Deducts the sold amount from the user's balance (funds are "frozen" in the Intent):
-   ```
-   balances[user][src_asset] -= src_amount
-   ```
-3. Creates an `Intent` record with status `Open`, `filled_amount = 0`.
-4. Assigns a unique monotonically increasing ID.
-5. Stores the Intent in the `intents` map.
-6. Returns the Intent ID.
-
-**The Intent now sits in the orderbook with status `Open`, waiting to be matched.**
-
-If no matching counterparty exists, the Intent remains Open indefinitely. The user can query the orderbook at any time to see their Intent's status.
-
-### Phase 3: Match (Batch Match + Auto MPC Sign)
-
-**Goal:** A set of compatible Intents is atomically matched, internal balances are swapped, and MPC signing is triggered for the corresponding external-chain transactions.
-
-**Step 3.1 — Off-chain: Relayer finds matching Intents:**
-
-The Relayer (or any participant):
-
-1. Queries `get_open_intents(from_index, limit)` to retrieve all Open Intents.
-2. Identifies a set of 2–6 Intents whose asset flows form a balanced cycle:
-   - For every asset, the total amount being sold (supplied) must be ≥ the total amount being bought (demanded).
-   - Each maker must receive at least their minimum price (`get_amount / fill_amount ≥ dst_amount / src_amount`).
-3. For each Intent in the matched set, constructs an **unsigned external-chain transaction**:
-   - This transaction will transfer the `src_asset` from the contract's MPC pool address to the appropriate recipient's external-chain address.
-   - The transaction is built according to the target chain's format:
-     - **Ethereum**: EIP-1559 Type 2 transaction with fields: `chainId`, `nonce`, `maxPriorityFeePerGas`, `maxFeePerGas`, `gasLimit`, `to`, `value`, `data`. Serialized using RLP encoding.
-     - **Solana**: A Solana `Transaction` with the appropriate transfer instruction, recent blockhash, and fee payer.
-     - **Bitcoin**: A standard Bitcoin transaction with inputs (UTXOs of the MPC address), outputs (recipient, change), and a locktime.
-4. Computes the **payload** for each unsigned transaction:
-   - **Ethereum**: `keccak256(rlp_encoded_unsigned_tx)` → 32 bytes.
-   - **Solana**: `sha256(serialized_message)` → 32 bytes.
-   - **Bitcoin**: `sha256(sha256(serialized_tx_for_signing))` → 32 bytes (per the sighash algorithm).
-5. Determines the **MPC derivation path** for each transaction. This path, combined with the orderbook contract's account ID, deterministically identifies which MPC-controlled address holds the funds.
-
-**Step 3.2 — Relayer submits the batch to NEAR:**
-
-- **NEAR Transaction:** Call `batch_match_intents` on the orderbook contract.
-- **Attached deposit:** Sufficient NEAR to cover the MPC signing fee (typically ~0.5 NEAR per signature, split across all matches).
-- **Parameters:** A `Vec<MatchParams>` containing, for each Intent:
-  - `intent_id`: Which Intent to fill.
-  - `fill_amount`: How much of the Intent to fill (can be less than `src_amount` for partial fills).
-  - `get_amount`: How much the maker receives in return.
-  - `payload`: The 32-byte hash of the unsigned external-chain transaction.
-  - `path`: The MPC derivation path string.
-  - `transition_chain_type`: Which external chain this transition targets.
-
-**Step 3.3 — Contract validates and executes the match:**
-
-For each `MatchParams` entry:
-
-1. **Status check**: Asserts the Intent is `Open`.
-2. **Remaining balance check**: Asserts `fill_amount ≤ (src_amount - filled_amount)`.
-3. **Price check**: Asserts `get_amount / fill_amount ≥ dst_amount / src_amount` (maker gets at least their limit price). Computed as integer math: `get_amount * src_amount ≥ fill_amount * dst_amount`.
-4. **Asset flow tracking**: Accumulates supply (from `src_asset`) and demand (from `dst_asset`) into a running balance map.
-5. **Update Intent state**: Increments `filled_amount`. If `filled_amount == src_amount`, sets status to `Filled`.
-6. **Create SubIntent**: A new `SubIntent` record with status `Verifying`, linking to the parent Intent.
-7. **Record TransitionExpectation**: Stores what the contract expects to see on the external chain after settlement (asset, amount, chain, memo).
-8. **Credit maker**: Adds `get_amount` of `dst_asset` to the maker's internal balance.
-
-After processing all entries:
-
-9. **Solvency check (conservation of mass)**: For every asset in the balance map, asserts `net ≥ 0` (total supply ≥ total demand). This ensures no asset is created out of thin air.
-
-**Step 3.4 — Contract auto-triggers MPC signing:**
-
-For each SubIntent created:
-
-1. Constructs a `SignRequest { payload, path, key_version: 0 }`.
-2. Makes a **cross-contract call** to the MPC signer contract:
-   ```
-   ext_signer::sign(request)
-   ```
-   - Attached deposit: A share of the total NEAR attached to the `batch_match_intents` call (split evenly).
-   - Gas: 30 TGas per sign call.
-3. Chains a **callback** to `self.on_signed(sub_id, chain_type, payload)`.
-4. Each promise chain is **detached** (`.detach()`) so they execute independently and in parallel.
-
-**Step 3.5 — MPC network processes the sign requests:**
-
-The NEAR MPC network (a distributed threshold signature protocol among multiple nodes):
-
-1. Receives the `sign` call.
-2. Verifies the caller is the predecessor (`orderbook_contract`).
-3. Derives the private key shard for the given `(predecessor_account_id, path)` combination.
-4. Performs a distributed signing protocol among MPC nodes to produce a signature over the `payload`.
-5. Returns `SignResult { big_r: AffinePoint, s: Scalar, recovery_id: u8 }`.
-   - For secp256k1 (ETH/BTC): This is an ECDSA `(r, s, v)` signature.
-   - For Ed25519 (SOL): This is an Ed25519 `(R, s)` signature.
-
-**Step 3.6 — Contract processes MPC callback (`on_signed`):**
-
-**On success:**
-
-1. Updates the SubIntent status: `Verifying → Settled`.
-2. Emits a log event containing the full signature:
-   ```
-   EVENT_JSON:{"sub_intent_id":..., "chain_type":..., "payload":"0x...", "big_r":"...", "s":"...", "recovery_id":..., "transition_memo":"transition:sub:..."}
-   ```
-   This event is publicly visible on NEAR and can be read by anyone.
-
-**On failure:**
-
-1. Rolls back the SubIntent status: `Verifying → Taken`.
-2. Removes the TransitionExpectation.
-3. The SubIntent can be retried later via `retry_settlement`.
-
-### Phase 4: Broadcast External-Chain Transactions
-
-**Goal:** The MPC-signed transactions are assembled and broadcast to external chain networks.
-
-**Step 4.1 — Relayer reads signature events:**
-
-The Relayer monitors the NEAR transaction receipts for `EVENT_JSON:` log entries from the `on_signed` callback. Each event contains:
-
-- The `payload` (hash of the unsigned transaction).
-- The MPC signature components (`big_r`, `s`, `recovery_id`).
-- The `chain_type` identifying which external chain.
-
-**Step 4.2 — Relayer assembles signed transactions:**
-
-For each signature event:
-
-1. Retrieves the corresponding unsigned transaction (which the Relayer constructed in Step 3.1).
-2. Combines the unsigned transaction with the MPC signature:
-   - **Ethereum**: Encodes the signed transaction using RLP with `(v, r, s)` appended, where `v = recovery_id + 27` (or adjusted for EIP-155). The result is a fully valid signed Ethereum transaction.
-   - **Solana**: Attaches the Ed25519 signature to the transaction's signature array. The result is a fully valid signed Solana transaction.
-   - **Bitcoin**: Inserts the DER-encoded `(r, s)` signature into the scriptSig or witness of the relevant input.
-
-**Step 4.3 — Relayer broadcasts to external chain:**
-
-1. Submits the signed transaction to the external chain's RPC endpoint:
-   - Ethereum: `eth_sendRawTransaction(signed_tx_hex)`
-   - Solana: `sendTransaction(signed_tx_base64)`
-   - Bitcoin: `sendrawtransaction(signed_tx_hex)`
-2. Receives the transaction hash.
-3. Waits for the transaction to be included in a block and reach sufficient confirmations.
-
-**Security Note:** The Relayer cannot tamper with the transaction because the MPC signature is mathematically bound to the specific `payload` (transaction hash). Any modification to the transaction would invalidate the signature. Additionally, since the signature is publicly available in NEAR logs, anyone can reconstruct and broadcast the transaction — the Relayer has no monopoly.
-
-### Phase 5: Transition Verification
-
-**Goal:** Verify on NEAR that the external-chain transactions have been confirmed, completing the SubIntent lifecycle.
-
-**Step 5.1 — Relayer submits transition proof:**
-
-After the external-chain transaction is confirmed:
-
-- **NEAR Transaction:** Call `verify_transition_completion` on the orderbook contract.
-- **Parameters:**
-  - `sub_intent_id`: Which SubIntent to verify.
-  - `proof_data`: Chain-specific inclusion proof (Merkle proof, block header, etc.).
-  - `recipient`: The external-chain address that received the transfer.
-  - `tx_hash`: The external-chain transaction hash.
-
-**Step 5.2 — Contract initiates Light Client verification:**
-
-1. Asserts the SubIntent status is `Settled`.
-2. Retrieves the stored `TransitionExpectation` for this SubIntent.
-3. Updates SubIntent status to `TransitionVerifying`.
-4. Makes a **cross-contract call** to the Light Client:
-   ```
-   ext_light_client::verify_transition_proof(
-       chain_type, proof_data, recipient, expected_asset,
-       expected_amount, expected_memo, expected_tx_hash
-   )
-   ```
-5. The Light Client verifies the proof (same verification logic as deposit proofs, plus tx_hash matching).
-
-**Step 5.3 — Contract processes verification callback (`on_transition_verified`):**
-
-**On success:**
-
-1. Updates SubIntent status: `TransitionVerifying → Completed`.
-2. Removes the TransitionExpectation record.
-3. Emits log: `TRANSITION_VERIFIED:sub_intent_id=...,tx_hash=...`
-4. The SubIntent lifecycle is now complete.
-
-**On failure:**
-
-1. Rolls back SubIntent status: `TransitionVerifying → Settled`.
-2. The verification can be retried with new/corrected proof data.
-3. Emits log: `TRANSITION_VERIFY_FAILED:sub_intent_id=...`
-
-### Phase 6: Withdrawal
-
-**Goal:** User withdraws their internal balance to an external-chain address.
-
-**Step 6.1 — User initiates withdrawal:**
-
-- **NEAR Transaction:** Call `withdraw` on the orderbook contract.
-- **Caller:** The user's NEAR account.
-- **Attached deposit:** Sufficient NEAR for MPC signing fee.
-- **Parameters:**
-  - `asset`: Which asset to withdraw.
-  - `amount`: How much to withdraw (in smallest unit).
-  - `payload`: The 32-byte hash of the unsigned withdrawal transaction (constructed off-chain, transferring from the contract's MPC address to the user's external-chain address).
-  - `path`: The MPC derivation path.
-  - `chain_type`: Target chain.
-
-**Step 6.2 — Contract processes withdrawal:**
-
-1. Verifies sufficient balance: `balances[user][asset] >= amount`.
-2. Deducts the balance immediately: `balances[user][asset] -= amount`.
-3. Records a `PendingWithdrawal { user, asset, amount }` for refund capability.
-4. Makes a cross-contract call to the MPC signer: `ext_signer::sign(request)`.
-5. Chains callback to `self.on_signed(wd_id, chain_type, payload)`.
-
-**Step 6.3 — MPC sign callback for withdrawal:**
-
-**On success:**
-
-1. Removes the PendingWithdrawal record (no refund needed).
-2. Emits the signature event. The Relayer (or user) can then assemble and broadcast the withdrawal transaction to the external chain.
-
-**On failure:**
-
-1. **Automatically refunds** the user's balance: `balances[user][asset] += amount`.
-2. Removes the PendingWithdrawal record.
-3. Emits log: `WITHDRAW_REFUNDED:user=...,asset=...,amount=...`
-4. The user can retry the withdrawal.
-
-### Phase 7: Retry Settlement (Failure Recovery)
-
-If the MPC signing step fails during batch matching (Step 3.6), the SubIntent is rolled back to `Taken` status. The original caller who submitted the batch can retry:
-
-- **NEAR Transaction:** Call `retry_settlement` on the orderbook contract.
-- **Caller:** Must be the same account that called `batch_match_intents`.
-- **Parameters:** `sub_intent_id`, new `payload`, new `path`, `transition_chain_type`.
-- The contract re-creates the TransitionExpectation, moves SubIntent to `Verifying`, and re-triggers the MPC sign call.
-
----
-
-## 5. Intent Lifecycle State Machine
+### ETH/AVAX Address (secp256k1)
 
 ```
-                    make_intent
-                        │
-                        ▼
-                    ┌────────┐
-                    │  Open  │ ◄─── (no match found: stays Open)
-                    └────┬───┘
-                         │ batch_match_intents
-                         │ (may be partial fill)
-                         ▼
-             ┌───────────────────────┐
-             │  Filled (if full)     │
-             │  Open (if partial)    │
-             └───────────────────────┘
+1. Call: derived_public_key({
+     predecessor: "ob.kaiyang.testnet",
+     path: "eth/kaiyang.testnet",
+     domain_id: 0
+   })
 
-  For each fill, a SubIntent is created:
+2. Response: "secp256k1:4HXZrMZi8J..."  (base58)
 
-                    ┌───────────┐
-                    │ Verifying │ ◄── batch_match_intents auto-triggers MPC sign
-                    └─────┬─────┘
-                   ┌──────┴──────┐
-           MPC OK  │             │  MPC FAIL
-                   ▼             ▼
-             ┌─────────┐   ┌─────────┐
-             │ Settled  │   │  Taken  │ ←── can retry_settlement
-             └────┬────┘   └────┬────┘
-                  │              │ retry
-                  │              └──► Verifying (loop back)
-                  │
-                  │ verify_transition_completion
-                  ▼
-        ┌────────────────────┐
-        │ TransitionVerifying│
-        └────────┬───────────┘
-          ┌──────┴──────┐
-   Proof OK│            │ Proof FAIL
-           ▼            ▼
-     ┌───────────┐  ┌─────────┐
-     │ Completed │  │ Settled │ ←── can retry verification
-     └───────────┘  └─────────┘
+3. Decode: Remove "secp256k1:" prefix, base58-decode
+   → 64 bytes (raw X||Y, no 0x04 prefix)
+   OR 65 bytes (0x04 + X||Y) — strip first byte
+   OR 33 bytes (compressed) — decompress on secp256k1 curve
+
+4. Hash:  keccak256(XY_64_bytes)
+   → 32 bytes
+
+5. Address: "0x" + last_40_hex_chars
+   → "0xd0cd508535275794568bff49497078c583e658a4"
 ```
 
----
-
-## 6. Multi-Party Ring Swap Mechanism
-
-The `batch_match_intents` function supports arbitrary N-party ring swaps (2 ≤ N ≤ 6). A ring swap is a set of Intents where the asset flows form a directed cycle.
-
-**Validation Logic:**
-
-For each asset type appearing across all matched Intents:
+**Decompression (for 33-byte compressed keys):**
 ```
-net[asset] = Σ(fill_amount where src_asset == asset) - Σ(get_amount where dst_asset == asset)
+p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+y² = x³ + 7 (mod p)
+y  = y² ^ ((p+1)/4) (mod p)        // Tonelli-Shanks shortcut for p ≡ 3 (mod 4)
+if (y%2 == 0) != (prefix == 0x02):
+    y = p - y
 ```
 
-The solvency check requires `net[asset] ≥ 0` for all assets. In a perfect ring swap, `net[asset] == 0` for all assets (perfect conservation).
+### SUI Address (ed25519)
 
-**Example (abstract 3-party ring):**
+```
+1. Call: derived_public_key({
+     predecessor: "ob.kaiyang.testnet",
+     path: "sui/kaiyang.testnet",
+     domain_id: 1
+   })
 
-- Intent A: sells asset X, wants asset Y
-- Intent B: sells asset Y, wants asset Z
-- Intent C: sells asset Z, wants asset X
+2. Response: "ed25519:7Fj9W..."  (base58)
 
-Asset flows: X(+A, -C) = 0, Y(+B, -A) = 0, Z(+C, -B) = 0. All nets are zero — valid ring.
+3. Decode: Remove "ed25519:" prefix, base58-decode
+   → 32 bytes (raw ed25519 public key)
 
-The contract does not need to understand the ring structure. It simply validates conservation across all asset types. This means it naturally supports any topology: direct swaps, triangular rings, 4+ party rings, and even partial fills within a ring.
+4. Prepend flag: 0x00 || pubkey_32_bytes
+   → 33 bytes
+
+5. Hash: blake2b(flagged_33_bytes, outputLen=32)
+   → 32 bytes
+
+6. Address: "0x" + hex(32_bytes)
+   → "0x8a4f2c..."
+```
+
+The `0x00` flag byte indicates the Ed25519 signature scheme in SUI's addressing convention.
+
+### Path Conventions
+
+| Path | Used For | Controlled By |
+|---|---|---|
+| `eth/kaiyang.testnet` | User's ETH deposit address | `ob.kaiyang.testnet` (via `lock_and_make_intent`) |
+| `sui/shangguan.testnet` | User's SUI deposit address | `ob.kaiyang.testnet` (via `lock_and_make_intent`) |
+| `avax/kaiyang.testnet` | User's AVAX deposit address | `ob.kaiyang.testnet` |
+| `eth/1` | Pool ETH address | `ob.kaiyang.testnet` (settlement) |
+| `sui/1` | Pool SUI address | `ob.kaiyang.testnet` (settlement) |
+| `avax/1` | Pool AVAX address | `ob.kaiyang.testnet` (settlement) |
 
 ---
 
 ## 7. Security Model
 
-### 7.1 MPC Trust Assumptions
+### Threat Model
 
-- The NEAR MPC network is a threshold signature scheme. No single node possesses the full private key.
-- Signatures can only be produced when the contract (`predecessor_account_id`) calls the MPC contract's `sign` method. The MPC network verifies that the calling contract is authorized for the given derivation path.
-- Even the orderbook contract owner cannot extract funds without going through the contract's coded logic (balance checks, intent matching, etc.).
+| Actor | Trust Level | What They Can Do | What They Cannot Do |
+|---|---|---|---|
+| **User** | Untrusted | Create/cancel intents, deposit, withdraw from own MPC addr | Access others' MPC addresses, forge deposits |
+| **Oracle Node** | Semi-trusted (threshold) | Attest to deposits they've verified on-chain | Submit false attestations (economic disincentive) |
+| **Relayer** | Untrusted | Match intents, submit batches, broadcast signed TXs | Steal funds, forge signatures, alter match prices |
+| **MPC Signer** | Trusted (protocol infra) | Sign payloads for authorized predecessors | Sign for unauthorized callers |
 
-### 7.2 Relayer Trust Assumptions
+### Security Properties
 
-- The Relayer is **untrusted**. It is a convenience service, not a security-critical component.
-- It cannot forge transactions (signatures are bound to specific payloads).
-- It cannot steal funds (it doesn't control MPC keys).
-- It cannot censor indefinitely (signature events are public, anyone can broadcast).
-- The worst a malicious Relayer can do is refuse to broadcast — but anyone can take over by reading NEAR logs.
+**1. Deposit Safety:**
+- Deposits are only credited after oracle attestation threshold is reached.
+- Replay protection via `verified_deposits: UnorderedSet<String>`.
+- Double-credit prevention: `assert!(!self.verified_deposits.contains(&tx_hash))`.
+- Oracle contract verifies: recipient, amount, and near_user consistency across attestations.
 
-### 7.3 Light Client Trust Assumptions
+**2. MPC Signature Binding:**
+- Only the `predecessor` account (orderbook contract) can request MPC signatures for its derived paths.
+- Path ownership check: `path.contains(caller.as_str())` in the contract.
+- Signatures are bound to specific payloads (transaction hashes) — can't be repurposed.
 
-- The Light Client is responsible for verifying that external-chain transactions actually occurred.
-- In production, this would verify Merkle proofs against trusted block headers, providing cryptographic guarantees.
-- The current implementation provides structural validation as a framework; full cryptographic verification is a production requirement.
+**3. Relayer Non-Custodial:**
+- The relayer submits `batch_match_intents` but the contract validates solvency and price fairness.
+- MPC signatures are emitted as public `EVENT_JSON` logs — any observer can pick them up.
+- The relayer cannot alter fill amounts, prices, or destination addresses.
+- Multiple relayers can operate in parallel.
 
-### 7.4 Balance Safety
+**4. Balance Integrity:**
+- `credit_deposit` is callable only by `light_client_contract` (the oracle contract).
+- `deposit_for` is callable only by `owner` (admin, for testing).
+- `cancel_intent` refunds only to the maker who created it.
+- Withdrawal auto-refund: if MPC signing fails, `on_signed` callback restores the deducted balance.
 
-- Deposits are only credited after Light Client verification of external-chain proofs.
-- Intent creation deducts balance (prevents double-spending).
-- Withdrawal failures automatically refund balance (atomic: either MPC sign succeeds or balance is restored).
-- Batch matching atomically updates all balances and verifies solvency before proceeding.
+**5. Price Protection:**
+- Price check in `batch_match_intents`:
+  ```
+  get_amount × intent.src_amount >= fill_amount × intent.dst_amount
+  ```
+  This ensures makers always receive at least their stated price.
+- Solvency check ensures no asset is created out of thin air.
+
+### Known Limitations (Demo)
+
+- **Threshold = 1**: A single oracle can verify deposits. Production would require higher thresholds.
+- **No slashing**: Malicious oracles face no economic penalty in this demo.
+- **No MEV protection**: Relayer ordering is first-come-first-served.
+- **No gas estimation**: ETH gas is hardcoded to 21000 (sufficient for simple transfers only).
+- **No expiry enforcement in auto-poll**: Expired intents are only checked during matching, not pruned.
+
+---
+
+## 8. Contract API Reference
+
+### 8.1 Orderbook Contract Methods
+
+#### Initialization
+
+| Method | Access | Parameters | Description |
+|---|---|---|---|
+| `new` | Init | `mpc_contract: AccountId, light_client_contract: AccountId` | Initialize with MPC signer and oracle contract references |
+| `migrate` | Init (ignore_state) | `mpc_contract: AccountId, light_client_contract: AccountId` | State migration — wipe and reinitialize (testnet only) |
+
+#### Write Methods — Deposits
+
+| Method | Access | Deposit | Gas | Description |
+|---|---|---|---|---|
+| `deposit_for(user, asset, amount)` | Owner only | — | — | Admin deposit for testing |
+| `credit_deposit(user, asset, amount, tx_hash)` | Oracle contract only | — | — | Credit after oracle attestation |
+| `verify_mpc_deposit(user, chain, asset, amount, recipient, memo, proof_data, tx_hash)` | Any (payable) | Yes | 80 TGas | Legacy: verify via light client cross-call |
+| `deposit_from_mpc(asset, amount, chain, sign_scheme, path, payload, eddsa_payload?)` | Any (payable) | Yes | 230 TGas | Deposit from user's MPC address to pool, trigger MPC sign |
+
+#### Write Methods — Intents
+
+| Method | Access | Deposit | Gas | Description |
+|---|---|---|---|---|
+| `lock_and_make_intent(src_asset, src_amount, dst_asset, dst_amount, expires_at, dst_address, chain, sign_scheme, path, payload, eddsa_payload?)` | Any (payable) | 0.1 NEAR | 300 TGas | Atomic: MPC sign lock TX + credit balance + create intent |
+| `make_intent(src_asset, src_amount, dst_asset, dst_amount, expires_at, dst_address)` | Any | — | ~30 TGas | Create intent from existing internal balance |
+| `cancel_intent(intent_id)` | Maker only | — | ~30 TGas | Cancel open intent, refund unfilled balance |
+
+#### Write Methods — Matching
+
+| Method | Access | Deposit | Gas | Description |
+|---|---|---|---|---|
+| `batch_match_intents(matches: Vec<MatchParams>)` | Any (payable) | 0.1 NEAR | 300 TGas | Match 2–6 intents, auto-trigger MPC signing |
+| `retry_settlement(sub_intent_id, payload, path, chain, sign_scheme, eddsa_payload?)` | Original matcher only (payable) | Yes | 230 TGas | Retry MPC signing for a failed sub-intent |
+
+#### Write Methods — Withdrawal
+
+| Method | Access | Deposit | Gas | Description |
+|---|---|---|---|---|
+| `withdraw(asset, amount, to_address, unsigned_tx, payload, path, chain, sign_scheme, eddsa_payload?)` | Any (payable) | Yes | 230 TGas | Withdraw from internal balance, MPC sign, auto-refund on failure |
+| `withdraw_from_mpc(chain, sign_scheme, path, to_address, amount, unsigned_tx, payload, eddsa_payload?)` | Any (payable) | Yes | 230 TGas | Withdraw from personal MPC address (no internal balance change) |
+
+#### Write Methods — Broadcast Queue
+
+| Method | Access | Description |
+|---|---|---|
+| `ack_broadcast(id)` | Any | Mark a broadcast task as completed |
+| `cleanup_completed(sub_intent_id)` | Any | Remove completed sub-intent to free storage |
+
+#### View Methods
+
+| Method | Parameters | Returns | Description |
+|---|---|---|---|
+| `get_intent(id)` | `id: U128` | `Option<Intent>` | Get a single intent by ID |
+| `get_sub_intent(id)` | `id: U128` | `Option<SubIntent>` | Get a single sub-intent by ID |
+| `get_open_intents(from_index, limit)` | `from_index: U128, limit: u64` | `Vec<Intent>` | Paginated open intents |
+| `get_intents_by_pair(src_asset, dst_asset)` | `src_asset: String, dst_asset: String` | `Vec<Intent>` | Open intents for a specific pair |
+| `get_open_intent_count()` | — | `u64` | Total count of open intents |
+| `get_balance(user, asset)` | `user: AccountId, asset: String` | `U128` | User's internal balance for an asset |
+| `get_deposit_events(limit?)` | `limit: Option<u32>` | `Vec<DepositEvent>` | Recent oracle-confirmed deposits (max 50) |
+| `get_broadcast_queue(limit?)` | `limit: Option<u32>` | `Vec<BroadcastTask>` | Pending broadcast tasks for relayer |
+
+#### Private Callbacks
+
+| Method | Description |
+|---|---|
+| `on_mpc_deposit_verified(...)` | Callback from `verify_mpc_deposit` light client check |
+| `on_deposit_signed(...)` | Callback from `deposit_from_mpc` MPC signing |
+| `on_lock_signed(...)` | Callback from `lock_and_make_intent` MPC signing |
+| `on_signed(id, chain, sign_scheme, payload)` | Shared callback for `batch_match`, `retry_settlement`, `withdraw`, `withdraw_from_mpc` |
+
+### 8.2 Oracle Contract Methods
+
+#### Initialization
+
+| Method | Access | Parameters | Description |
+|---|---|---|---|
+| `new` | Init | `owner: AccountId, threshold: u32, orderbook_contract: AccountId` | Initialize oracle contract |
+| `migrate` | Init (ignore_state) | Same as `new` | State migration (testnet) |
+
+#### Admin Methods (Owner Only)
+
+| Method | Parameters | Description |
+|---|---|---|
+| `add_oracle(oracle_id)` | `oracle_id: AccountId` | Register an oracle node |
+| `remove_oracle(oracle_id)` | `oracle_id: AccountId` | Deregister an oracle node |
+| `set_threshold(threshold)` | `threshold: u32` (> 0) | Update attestation threshold |
+| `set_orderbook(orderbook_contract)` | `orderbook_contract: AccountId` | Update orderbook contract reference |
+
+#### Oracle Methods
+
+| Method | Access | Parameters | Description |
+|---|---|---|---|
+| `attest(chain, tx_hash, recipient, sender, amount, near_user)` | Registered oracles only | See below | Submit deposit attestation |
+
+`attest` parameters:
+- `chain: String` — "ETH", "SUI", or "AVAX"
+- `tx_hash: String` — External chain transaction hash
+- `recipient: String` — MPC deposit address (expected)
+- `sender: String` — External wallet that sent the deposit
+- `amount: U128` — Deposit amount in smallest unit (wei, mist)
+- `near_user: String` — NEAR account to credit
+
+Returns `Option<Promise>` — a cross-contract call to `credit_deposit` when threshold is met.
+
+#### View Methods
+
+| Method | Parameters | Returns | Description |
+|---|---|---|---|
+| `get_oracles()` | — | `Vec<AccountId>` | List all registered oracle accounts |
+| `get_threshold()` | — | `u32` | Current attestation threshold |
+| `get_orderbook()` | — | `AccountId` | Current orderbook contract reference |
+| `get_attestation(chain, tx_hash)` | `chain: String, tx_hash: String` | `Option<DepositAttestation>` | Full attestation record |
+| `is_verified(chain, tx_hash)` | `chain: String, tx_hash: String` | `bool` | Whether deposit reached threshold |
+
+#### Legacy Methods
+
+| Method | Description |
+|---|---|
+| `verify_payment_proof(chain, proof_data, expected_recipient, expected_asset, expected_amount, expected_memo)` | Backward-compatible verification (checks attestation status) |
+
+---
+
+## 9. Data Structures
+
+### Orderbook Contract Structs
+
+```rust
+pub struct Intent {
+    pub id: u64,
+    pub maker: AccountId,
+    pub src_asset: String,        // "ETH", "SUI", "AVAX"
+    pub src_amount: u128,         // in smallest unit (wei/mist)
+    pub filled_amount: u128,      // how much has been matched
+    pub dst_asset: String,
+    pub dst_amount: u128,
+    pub status: IntentStatus,
+    pub expires_at: u64,          // nanosecond timestamp, 0 = no expiry
+    pub dst_address: String,      // maker's receiving address on dst chain
+    pub src_path: String,         // MPC derivation path on src chain
+}
+
+pub enum IntentStatus {
+    Open,                 // Awaiting match
+    Filled,               // Fully matched, awaiting settlement
+    Taken,                // MPC sign failed, retryable
+    Verifying,            // MPC signing in progress
+    Settled,              // Settlement confirmed
+    TransitionVerifying,  // Transition proof in progress
+    Completed,            // All done
+    Cancelled,            // Maker cancelled
+}
+
+pub struct SubIntent {
+    pub id: u64,
+    pub parent_intent_id: u64,
+    pub taker: AccountId,         // who submitted the match
+    pub amount: u128,             // fill amount
+    pub status: IntentStatus,
+}
+
+pub struct MatchParams {
+    pub intent_id: U128,
+    pub fill_amount: U128,
+    pub get_amount: U128,
+    pub payload: [u8; 32],        // keccak256 hash for ECDSA
+    pub path: String,             // MPC derivation path
+    pub chain: String,            // "ETH", "SUI", "AVAX"
+    pub sign_scheme: String,      // "ECDSA" or "EDDSA"
+    pub eddsa_payload: Option<Vec<u8>>, // raw bytes for EdDSA
+}
+
+pub struct PendingWithdrawal {
+    pub user: AccountId,
+    pub asset: String,
+    pub amount: u128,
+}
+
+pub struct OperationMeta {
+    pub chain: String,
+    pub sign_scheme: String,
+    pub path: String,
+    pub to_address: String,
+    pub amount: u128,
+    pub unsigned_tx: String,      // hex-encoded unsigned transaction
+}
+
+pub struct BroadcastTask {
+    pub id: u64,
+    pub chain: String,
+    pub sign_scheme: String,
+    pub path: String,
+    pub to_address: String,
+    pub amount: U128,
+    pub unsigned_tx: String,
+    pub big_r: String,            // ECDSA R point or EdDSA R
+    pub s_value: String,          // ECDSA s scalar or EdDSA s
+    pub recovery_id: u8,          // ECDSA recovery (0/1)
+    pub signature_hex: String,    // EdDSA full signature hex
+    pub payload_hex: String,
+    pub created_at: u64,          // block timestamp
+}
+
+pub struct DepositEvent {
+    pub user: AccountId,
+    pub asset: String,
+    pub amount: u128,
+    pub tx_hash: String,
+    pub timestamp: u64,           // nanosecond block timestamp
+}
+
+pub struct SignatureEvent {
+    pub sub_intent_id: u64,
+    pub chain: String,
+    pub sign_scheme: String,
+    pub payload: String,          // hex
+    pub big_r: String,
+    pub s: String,
+    pub recovery_id: u8,
+    pub signature: String,        // full sig hex (EdDSA)
+    pub transition_memo: String,  // e.g., "settlement:sub:42"
+}
+
+pub struct TransitionExpectation {
+    pub sub_intent_id: u64,
+    pub chain: String,
+    pub expected_asset: String,
+    pub expected_amount: u128,
+    pub expected_memo: String,
+}
+```
+
+### MPC Signature Types
+
+```rust
+pub struct EcdsaSignResult {
+    pub big_r: AffinePoint,       // { affine_point: String }
+    pub s: Scalar,                // { scalar: String }
+    pub recovery_id: u8,
+}
+
+pub struct AffinePoint {
+    pub affine_point: String,     // hex-encoded compressed point
+}
+
+pub struct Scalar {
+    pub scalar: String,           // hex-encoded 32-byte scalar
+}
+
+pub enum SignResult {
+    Ecdsa(EcdsaSignResult),
+    EddsaBytes(EddsaSignResultBytes),  // { signature: Vec<u8> }
+    EddsaHex(EddsaSignResultHex),      // { scheme?, signature: String }
+    EddsaString(String),               // raw hex fallback
+}
+```
+
+### Oracle Contract Structs
+
+```rust
+pub struct DepositAttestation {
+    pub chain: String,
+    pub tx_hash: String,
+    pub recipient: String,        // MPC address on external chain
+    pub sender: String,           // user's external wallet
+    pub amount: u128,
+    pub near_user: String,        // NEAR account to credit
+    pub confirmations: HashSet<AccountId>,  // set of oracles that attested
+    pub resolved: bool,           // true when threshold reached
+}
+```
+
+### Frontend Types (`types.ts`)
+
+```typescript
+export interface Intent {
+  id: number;
+  maker: string;
+  src_asset: string;
+  src_amount: string;        // u128 stringified
+  filled_amount: string;
+  dst_asset: string;
+  dst_amount: string;
+  status: string | { [key: string]: unknown };
+  expires_at: number;
+  dst_address: string;
+  src_path: string;
+}
+
+interface TxPayload {
+  chain: "ETH" | "SUI" | "AVAX";
+  signScheme: "ECDSA" | "EDDSA";
+  path: string;
+  payload: number[];              // 32 bytes
+  eddsaPayload: number[] | null;
+  fromAddress: string;
+  toAddress: string;
+  unsignedTxHex?: string;         // EVM serialized
+  unsignedTxBytes?: number[];     // SUI raw bytes
+}
+
+interface SignatureEvent {
+  sub_intent_id: number;
+  chain: string;
+  sign_scheme: string;
+  payload: string;
+  big_r: string;
+  s: string;
+  recovery_id: number;
+  signature: string;
+  transition_memo: string;
+}
+```
+
+---
+
+## 10. Configuration & Environment
+
+### Oracle Node (`.env`)
+
+```bash
+NEAR_NETWORK=testnet
+NEAR_RPC_URL=https://rpc.testnet.near.org
+NEAR_RPC_URLS=https://test.rpc.fastnear.com,https://rpc.testnet.fastnear.com
+
+ORACLE_CONTRACT_ID=lc.kaiyang.testnet        # a.k.a. oracle contract
+ORACLE_ACCOUNT_ID=oracle-node-1.kaiyang.testnet
+ORACLE_PRIVATE_KEY=ed25519:xxxxx
+
+ORDERBOOK_CONTRACT_ID=ob.kaiyang.testnet
+MPC_CONTRACT_ID=v1.signer-prod.testnet
+
+ETH_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com
+SUI_RPC_URL=https://fullnode.testnet.sui.io:443
+AVAX_RPC_URL=https://api.avax-test.network/ext/bc/C/rpc
+
+POLL_INTERVAL_MS=15000
+ETH_CONFIRMATIONS=3
+SUI_CONFIRMATIONS=1
+AVAX_CONFIRMATIONS=3
+
+ORACLE_REQUEST_API_ENABLED=true
+ORACLE_REQUEST_API_HOST=0.0.0.0
+ORACLE_REQUEST_API_PORT=8787
+ORACLE_REQUEST_API_ALLOWED_ORIGIN=*
+```
+
+### Relayer (`.env`)
+
+```bash
+NEAR_NETWORK=testnet
+NEAR_RPC_URL=https://rpc.testnet.near.org
+CONTRACT_ID=ob.kaiyang.testnet
+RELAYER_ACCOUNT_ID=ob.kaiyang.testnet
+RELAYER_PRIVATE_KEY=ed25519:xxxxx
+MPC_CONTRACT_ID=v1.signer-prod.testnet
+ETH_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com
+SUI_RPC_URL=https://fullnode.testnet.sui.io:443
+POLL_INTERVAL_MS=10000
+MPC_DEPOSIT_NEAR=0.5
+RUN_ONCE=false
+```
+
+### Frontend (`config.ts`)
+
+```typescript
+export const CONTRACT_ID = "ob.kaiyang.testnet";
+export const ORACLE_CONTRACT_ID = "lc.kaiyang.testnet";
+export const NETWORK_ID = "testnet";
+export const NEAR_RPC_URLS = [
+  "https://test.rpc.fastnear.com",
+  "https://rpc.testnet.fastnear.com",
+];
+export const ORACLE_REVIEW_API_URL = "http://127.0.0.1:8787";
+export const KNOWN_ASSETS = [
+  { label: "ETH (Sepolia)", value: "ETH" },
+  { label: "SUI (Testnet)", value: "SUI" },
+  { label: "AVAX (Fuji)", value: "AVAX" },
+  { label: "USDC", value: "USDC" },
+  { label: "USDT", value: "USDT" },
+];
+```
+
+### Chain-to-Scheme Mapping (Relayer)
+
+```javascript
+chainSignScheme: {
+    ETH: "ECDSA",     AVAX: "ECDSA",
+    BTC: "ECDSA",     BSC: "ECDSA",    POLYGON: "ECDSA",
+    SUI: "EDDSA",     SOL: "EDDSA",    APTOS: "EDDSA",
+}
+```
+
+---
+
+## 11. Testnet Deployment
+
+### Contract Accounts
+
+| Component | Account / URL |
+|---|---|
+| Orderbook Contract | `ob.kaiyang.testnet` |
+| Oracle / Light Client Contract | `lc.kaiyang.testnet` |
+| MPC Signer (NEAR infra) | `v1.signer-prod.testnet` |
+
+### Test User Accounts
+
+| User | Account |
+|---|---|
+| User A | `kaiyang.testnet` |
+| User B | `shangguan.testnet` |
+
+### Service Endpoints
+
+| Service | URL | Port |
+|---|---|---|
+| Frontend (Vite dev) | `http://localhost:5173` | 5173 |
+| Oracle Review API | `http://127.0.0.1:8787` | 8787 |
+| Oracle Health Check | `GET http://127.0.0.1:8787/health` | 8787 |
+
+### External Chain RPCs
+
+| Chain | Primary RPC | Fallback RPCs |
+|---|---|---|
+| ETH Sepolia | Alchemy Sepolia | Tenderly, drpc, publicnode |
+| SUI Testnet | `https://fullnode.testnet.sui.io:443` | — |
+| AVAX Fuji | `https://api.avax-test.network/ext/bc/C/rpc` | publicnode |
+| NEAR Testnet | `https://test.rpc.fastnear.com` | `https://rpc.testnet.fastnear.com` |
+
+### Block Explorers
+
+| Chain | Explorer |
+|---|---|
+| ETH Sepolia | `https://sepolia.etherscan.io/tx/{hash}` |
+| SUI Testnet | `https://suiscan.xyz/testnet/tx/{hash}` |
+| AVAX Fuji | `https://testnet.snowtrace.io/tx/{hash}` |
+| NEAR Testnet | `https://testnet.nearblocks.io/txns/{hash}` |
+
+### Deployment Script
+
+```bash
+# Full deployment from scratch:
+./scripts/deploy_testnet.sh
+
+# Reuse existing accounts:
+DEPLOY_MODE=reuse SKIP_CREATE=1 ./scripts/deploy_testnet.sh
+
+# Fresh accounts:
+DEPLOY_MODE=fresh ./scripts/deploy_testnet.sh
+```
+
+The deployment script:
+1. Checks for `near` CLI and Rust toolchain.
+2. Creates testnet accounts via faucet service (with rate-limit retry).
+3. Builds WASM for `orderbook-contract` and `light-client` using `cargo build --target wasm32-unknown-unknown --release`.
+4. Optionally optimizes with `wasm-opt -Oz` to avoid deserialization errors on Rust 1.82+.
+5. Deploys WASM to respective accounts.
+6. Initializes: Oracle contract with threshold=1, adds self as oracle. Orderbook initialized with MPC + oracle references.
+
+---
+
+## 12. File Structure
+
+```
+Near-Intent-ChainSig-Orderbook/
+│
+├── Cargo.toml                           # Workspace root (members: orderbook-contract, light-client)
+├── Cargo.lock
+├── TECHNICAL_DESCRIPTION.md             # This document
+│
+├── orderbook-contract/                  # NEAR smart contract: orderbook + MPC orchestration
+│   ├── Cargo.toml                       # Dependencies: near-sdk, hex
+│   └── src/
+│       ├── lib.rs                       # (1354 lines) Main contract: state, deposit, intent,
+│       │                                #   match, withdraw, MPC callbacks, views, helpers
+│       └── tests.rs                     # Unit tests
+│
+├── light-client/                        # NEAR smart contract: oracle attestation system
+│   ├── Cargo.toml                       # Dependencies: near-sdk
+│   └── src/
+│       └── lib.rs                       # (224 lines) Oracle: attest, threshold, credit_deposit
+│
+├── oracle-node/                         # Off-chain Node.js oracle service
+│   ├── package.json                     # Dependencies: near-api-js, ethers, blakejs, @mysten/sui
+│   ├── package-lock.json
+│   ├── .env.example                     # Environment template
+│   ├── watch-addresses.json             # Manual watch list for auto-poll mode
+│   └── src/
+│       ├── index.js                     # (533 lines) Main: review API, auto-poll, chain scanning
+│       ├── near-client.js               # (87 lines) NEAR RPC with multi-endpoint failover
+│       ├── address-resolver.js          # (119 lines) MPC address derivation (ETH/SUI/AVAX)
+│       └── config.js                    # (47 lines) Env config loader
+│
+├── relayer/                             # Off-chain Node.js relayer service
+│   ├── package.json
+│   ├── .env.example
+│   └── src/
+│       ├── index.js                     # (573 lines) Main loop: poll → match → build → submit → broadcast
+│       ├── matcher.js                   # (311 lines) Pair matching + ring matching (DFS cycle detection)
+│       ├── eth-utils.js                 # (213 lines) ETH: address derive, tx build/sign/broadcast
+│       ├── sui-utils.js                 # (196 lines) SUI: address derive, tx build/sign/broadcast
+│       ├── near-client.js               # NEAR RPC client
+│       └── config.js                    # (75 lines) Config with chain/scheme mappings
+│
+├── frontend/                            # React + TypeScript + Vite + Tailwind
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   ├── tailwind.config.js
+│   ├── index.html
+│   └── src/
+│       ├── main.tsx                     # Vite entry point
+│       ├── App.tsx                      # (37 lines) Three-panel layout
+│       ├── WalletContext.tsx             # (196 lines) NEAR wallet connection + multi-RPC
+│       ├── config.ts                    # (17 lines) Contract IDs, RPC URLs, assets
+│       ├── types.ts                     # (18 lines) Intent interface + statusLabel
+│       ├── mpc.ts                       # (584 lines) MPC derivation, tx build, broadcast
+│       └── components/
+│           ├── UserPanel.tsx            # (709 lines) Wallet, deposit, intent, withdraw, oracle
+│           ├── OrderBook.tsx            # (450 lines) Intents table, ledger, pool, events
+│           └── RelayerPanel.tsx         # (553 lines) Select, match, scan, broadcast
+│
+└── scripts/                             # Deployment and utility scripts
+    ├── deploy_testnet.sh                # Full deployment pipeline (accounts, build, deploy, init)
+    ├── upgrade_oracle.sh                # Oracle contract upgrade with migration
+    ├── derive_eth_address.js            # CLI: derive ETH address from MPC path
+    ├── derive_sui_address.js            # CLI: derive SUI address from MPC path
+    ├── eth_tx_helper.js                 # CLI: build + broadcast ETH transactions
+    ├── sui_tx_helper.js                 # CLI: build + broadcast SUI transactions
+    ├── package.json
+    └── package-lock.json
+```
+
+---
+
+## 13. Dependencies & Build
+
+### Rust Contracts
+
+**Toolchain:** Rust 1.86.0 + `wasm32-unknown-unknown` target
+
+**Orderbook contract dependencies:**
+- `near-sdk` — NEAR smart contract SDK (borsh, serde, collections, ext_contract)
+- `hex` — Hex encoding/decoding for MPC payloads
+
+**Light client dependencies:**
+- `near-sdk`
+
+**Build commands:**
+```bash
+# Build both contracts:
+cargo +1.86.0 build -p orderbook-contract --target wasm32-unknown-unknown --release
+cargo +1.86.0 build -p light-client --target wasm32-unknown-unknown --release
+
+# Optimize (required for Rust 1.82+):
+wasm-opt -Oz -o output.wasm input.wasm
+```
+
+### Oracle Node
+
+**Runtime:** Node.js (ES modules via CommonJS require)
+
+| Package | Version | Purpose |
+|---|---|---|
+| `near-api-js` | ^5.0.1 | NEAR RPC, account management, key storage |
+| `ethers` | ^6.16.0 | EVM RPC, transaction building |
+| `blakejs` | ^1.2.1 | Blake2b hashing (SUI address derivation) |
+| `@mysten/sui` | ^1.0.0 | SUI RPC client |
+| `@noble/hashes` | ^2.0.1 | Cryptographic hash functions |
+
+### Relayer
+
+Similar to oracle node, plus:
+| Package | Purpose |
+|---|---|
+| `chainsig.js` | Chain Signatures JS SDK (MPC key derivation) |
+| `bs58` | Base58 encoding/decoding |
+
+### Frontend
+
+| Package | Purpose |
+|---|---|
+| `react` + `react-dom` | UI framework |
+| `@near-wallet-selector/core` | NEAR wallet abstraction |
+| `@near-wallet-selector/my-near-wallet` | MyNearWallet integration |
+| `near-api-js` | NEAR RPC provider |
+| `@near-js/transactions` | Transaction action builders |
+| `ethers` | EVM transaction building |
+| `@mysten/sui` | SUI transaction building |
+| `bs58` | Base58 decode (MPC public keys) |
+| `blakejs` | Blake2b (SUI address + digest) |
+| `vite` | Build tool |
+| `tailwindcss` | Utility-first CSS |
+| `typescript` | Type checking |
+
+### Running the System
+
+```bash
+# 1. Start Oracle Node (review API mode):
+cd oracle-node && npm install && npm start
+
+# 2. Start Relayer (optional, for automated matching):
+cd relayer && npm install && node src/index.js
+
+# 3. Start Frontend:
+cd frontend && npm install && npm run dev
+
+# 4. Open http://localhost:5173 in browser
+```
+
+**End-to-end demo flow:**
+1. Connect MyNearWallet as `kaiyang.testnet`.
+2. Select "ETH" as sell chain → derive MPC deposit address.
+3. Send ETH from MetaMask to the MPC address.
+4. Paste the ETH tx hash → Request Oracle Review.
+5. Wait for "Done: Deposit events and internal ledger refreshed."
+6. Fill in sell/buy amounts → "Lock & Create Intent".
+7. On another browser, connect as `shangguan.testnet`, create a complementary intent.
+8. In the Relayer Panel: select both intents → Build Payloads → Submit Match.
+9. Paste the NEAR tx hash → Scan → Broadcast All.
+10. Verify on Etherscan/Suiscan that the settlement transactions landed.

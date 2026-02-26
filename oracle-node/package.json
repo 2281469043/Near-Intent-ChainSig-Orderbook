@@ -1,0 +1,17 @@
+{
+  "name": "oracle-node",
+  "version": "1.0.0",
+  "description": "Multi-sig Oracle node: monitors external chains and attests deposits to NEAR Oracle contract",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "start:review-api": "ORACLE_REQUEST_API_ENABLED=true node src/index.js"
+  },
+  "dependencies": {
+    "@mysten/sui": "^1.0.0",
+    "@noble/hashes": "^2.0.1",
+    "blakejs": "^1.2.1",
+    "ethers": "^6.16.0",
+    "near-api-js": "^5.0.1"
+  }
+}

@@ -238,11 +238,11 @@ else
     echo "Deploying Orderbook to $CONTRACT_ID ..."
     near contract deploy $CONTRACT_ID use-file "$ORDERBOOK_WASM" without-init-call network-config "$NETWORK_CONFIG" sign-with-keychain send
 
-    echo "Deploying Light Client to $RELAYER_ID ..."
+    echo "Deploying Oracle Contract to $RELAYER_ID ..."
+    ORACLE_THRESHOLD="${ORACLE_THRESHOLD:-1}"
     near contract deploy $RELAYER_ID use-file "$LIGHT_CLIENT_WASM" without-init-call network-config "$NETWORK_CONFIG" sign-with-keychain send
-    near contract call-function as-transaction $RELAYER_ID new json-args "{\"owner_id\": \"$RELAYER_ID\"}" prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as $RELAYER_ID network-config "$NETWORK_CONFIG" sign-with-keychain send
-    near contract call-function as-transaction $RELAYER_ID set_finalized_height json-args "{\"chain_type\":\"ETH\",\"finalized_height\":999999999}" prepaid-gas '50.0 Tgas' attached-deposit '0 NEAR' sign-as $RELAYER_ID network-config "$NETWORK_CONFIG" sign-with-keychain send
-    near contract call-function as-transaction $RELAYER_ID set_finalized_height json-args "{\"chain_type\":\"SOL\",\"finalized_height\":999999999}" prepaid-gas '50.0 Tgas' attached-deposit '0 NEAR' sign-as $RELAYER_ID network-config "$NETWORK_CONFIG" sign-with-keychain send
+    near contract call-function as-transaction $RELAYER_ID new json-args "{\"owner\": \"$RELAYER_ID\", \"threshold\": $ORACLE_THRESHOLD, \"orderbook_contract\": \"$CONTRACT_ID\"}" prepaid-gas '100.0 Tgas' attached-deposit '0 NEAR' sign-as $RELAYER_ID network-config "$NETWORK_CONFIG" sign-with-keychain send
+    near contract call-function as-transaction $RELAYER_ID add_oracle json-args "{\"oracle_id\": \"$RELAYER_ID\"}" prepaid-gas '50.0 Tgas' attached-deposit '0 NEAR' sign-as $RELAYER_ID network-config "$NETWORK_CONFIG" sign-with-keychain send
 
     echo "=== 5. Initializing contract ==="
     echo "Initializing Orderbook..."

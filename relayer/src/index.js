@@ -74,13 +74,16 @@ async function main() {
 // ========================================================================
 
 async function runCycle() {
+  // ── Phase A: Process broadcast queue (withdraw txs signed by MPC) ──
+  await processBroadcastQueue();
+
   // ── Phase 1: Poll open intents ──
   console.log("─── Phase 1: Poll Open Intents ───");
   const intents = await near.getOpenIntents();
   console.log(`[Poll] Found ${intents.length} open intent(s)`);
 
   if (intents.length < 2) {
-    console.log("[Poll] Not enough intents to match. Waiting...");
+    console.log("[Poll] Not enough intents to match.");
     return;
   }
 
@@ -96,13 +99,12 @@ async function runCycle() {
   const matchGroups = findAllMatches(intents);
 
   if (matchGroups.length === 0) {
-    console.log("[Matcher] No compatible matches found. Waiting...");
+    console.log("[Matcher] No compatible matches found.");
     return;
   }
 
   console.log(`[Matcher] Found ${matchGroups.length} match group(s)`);
 
-  // Process each match group
   for (const group of matchGroups) {
     try {
       await processMatchGroup(group);
@@ -183,17 +185,7 @@ async function processMatchGroup(group) {
     }
   }
 
-  // ── Phase 7: Transition Verification ──
-  console.log("\n─── Phase 7: Transition Verification ───");
-  for (const result of broadcastResults) {
-    try {
-      await submitTransitionProof(result);
-    } catch (err) {
-      console.error(
-        `[Verify] Failed for sub_intent #${result.subIntentId}: ${err.message}`
-      );
-    }
-  }
+  console.log("\n─── Settlement Complete (sub-intents marked Completed) ───");
 
   console.log("\n✓ Match group processing complete");
 }
@@ -487,41 +479,78 @@ function findPendingTxByChain(chain) {
 }
 
 // ========================================================================
-// Phase 7: Submit transition proof
+// Broadcast Queue: auto-broadcast MPC-signed withdraw transactions
 // ========================================================================
 
-/**
- * After an external chain tx is confirmed, submit proof to the contract
- * for transition verification via the Light Client.
- */
-async function submitTransitionProof(result) {
-  if (!result || !result.txHash) return;
-
-  console.log(
-    `[Verify] Submitting transition proof for sub-intent #${result.subIntentId}`
-  );
-  console.log(`  tx_hash:    ${result.txHash}`);
-  console.log(`  chain:      ${result.chain}`);
-
+async function processBroadcastQueue() {
+  let tasks;
   try {
-    // In production, proof_data would be a Merkle proof / SPV proof
-    // fetched from the external chain. For the Light Client skeleton,
-    // we pass the tx receipt data.
-    const proofData = Buffer.from(result.txHash.slice(2), "hex");
-    const recipient = "derived-address"; // would be the actual recipient
-
-    const outcome = await near.verifyTransitionCompletion(
-      result.subIntentId,
-      Array.from(proofData),
-      recipient,
-      result.txHash
-    );
-
-    near.printOutcomeLogs(outcome);
-    console.log(`[Verify] Transition proof submitted for sub-intent #${result.subIntentId}`);
+    tasks = await near.getBroadcastQueue(50);
   } catch (err) {
-    console.error(`[Verify] Proof submission failed: ${err.message}`);
-    console.log("[Verify] Can retry later — sub-intent remains in Settled state.");
+    console.warn(`[BroadcastQ] Failed to fetch queue: ${err.message}`);
+    return;
+  }
+
+  if (!tasks || tasks.length === 0) return;
+
+  console.log(`\n─── Broadcast Queue: ${tasks.length} pending task(s) ───`);
+
+  for (const task of tasks) {
+    try {
+      console.log(
+        `[BroadcastQ] #${task.id}: ${task.chain} ${task.sign_scheme} → ${task.to_address.slice(0, 12)}…`
+      );
+
+      let txHash;
+      if (task.sign_scheme === "ECDSA") {
+        const signedTx = eth.assembleSignedEthTx(
+          task.unsigned_tx,
+          task.big_r,
+          task.s_value,
+          task.recovery_id
+        );
+        if (config.ethRpcUrl) {
+          const result = await eth.broadcastEthTx(signedTx.signedSerialized);
+          txHash = result.txHash;
+        } else {
+          console.log(`  [skip] No RPC URL for ${task.chain}`);
+          continue;
+        }
+      } else if (task.sign_scheme === "EDDSA") {
+        const signatureHex = task.signature_hex || (task.big_r + task.s_value);
+        const mpcPubKey = await near.deriveMpcPublicKey(task.path);
+        let pubKeyHex;
+        if (typeof mpcPubKey === "string") {
+          const raw = mpcPubKey.replace("ed25519:", "");
+          pubKeyHex = Buffer.from(raw, "base64").toString("hex");
+        } else {
+          pubKeyHex = mpcPubKey;
+        }
+        const { serializedSigBase64 } = sui.assembleSignedSuiTx(signatureHex, pubKeyHex);
+        const txBytesBase64 = Buffer.from(task.unsigned_tx, "hex").toString("base64");
+        if (config.suiRpcUrl) {
+          const result = await sui.broadcastSuiTx(txBytesBase64, serializedSigBase64);
+          txHash = result.txHash;
+        } else {
+          console.log(`  [skip] No RPC URL for SUI`);
+          continue;
+        }
+      } else {
+        console.log(`  [skip] Unsupported sign_scheme: ${task.sign_scheme}`);
+        continue;
+      }
+
+      console.log(`  [BroadcastQ] ✓ Broadcast OK: ${txHash}`);
+
+      try {
+        await near.ackBroadcast(task.id);
+        console.log(`  [BroadcastQ] ✓ Acknowledged #${task.id}`);
+      } catch (ackErr) {
+        console.warn(`  [BroadcastQ] Ack failed (tx already broadcast): ${ackErr.message}`);
+      }
+    } catch (err) {
+      console.error(`  [BroadcastQ] Failed #${task.id}: ${err.message}`);
+    }
   }
 }
 

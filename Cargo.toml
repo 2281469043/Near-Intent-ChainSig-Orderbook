@@ -1,8 +1,6 @@
 [workspace]
 members = [
     "orderbook-contract",
-    "mpc-relayer",
-    "mock-prover",
-    "light-client"
+    "light-client",
 ]
 resolver = "2"

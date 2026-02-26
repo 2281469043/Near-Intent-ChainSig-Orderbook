@@ -3,12 +3,85 @@ import { ethers, keccak256 } from "ethers";
 import blakejs from "blakejs";
 import { SuiClient } from "@mysten/sui/client";
 import { Transaction } from "@mysten/sui/transactions";
-import { NODE_URL, CONTRACT_ID } from "./config";
+import { NEAR_RPC_URLS, CONTRACT_ID } from "./config";
 
 const MPC_CONTRACT = "v1.signer-prod.testnet";
-const ETH_RPC = "https://1rpc.io/sepolia";
-const SUI_RPC = "https://fullnode.testnet.sui.io:443";
-const AVAX_RPC = "https://api.avax-test.network/ext/bc/C/rpc";
+const ETH_RPCS = [
+  "https://eth-sepolia.g.alchemy.com/v2/mwyvy4uTV1x9y9B9F3SbC",
+  "https://sepolia.gateway.tenderly.co",
+  "https://sepolia.drpc.org",
+  "https://ethereum-sepolia-rpc.publicnode.com",
+];
+const SUI_RPCS = [
+  "https://fullnode.testnet.sui.io:443",
+];
+const AVAX_RPCS = [
+  "https://api.avax-test.network/ext/bc/C/rpc",
+  "https://avalanche-fuji-c-chain-rpc.publicnode.com",
+];
+
+interface JsonRpcError {
+  message?: string;
+}
+
+interface JsonRpcResponse<T> {
+  result?: T;
+  error?: JsonRpcError;
+}
+
+async function callRpcWithFallback<T>(
+  urls: string[],
+  method: string,
+  params: unknown[],
+): Promise<T> {
+  let lastError: unknown = null;
+
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method,
+          params,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = await res.json() as JsonRpcResponse<T>;
+      if (data.error) {
+        throw new Error(data.error.message || `${method} failed`);
+      }
+      if (data.result === undefined) {
+        throw new Error(`${method} missing result`);
+      }
+      return data.result;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+
+  throw new Error(`RPC unavailable for ${method}: ${(lastError as Error)?.message || "unknown error"}`);
+}
+
+async function withEvmProvider<T>(
+  urls: string[],
+  fn: (provider: ethers.JsonRpcProvider) => Promise<T>,
+): Promise<T> {
+  let lastError: unknown = null;
+  for (const url of urls) {
+    const provider = new ethers.JsonRpcProvider(url);
+    try {
+      return await fn(provider);
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw new Error(`EVM RPC unavailable: ${(lastError as Error)?.message || "unknown error"}`);
+}
 
 // ---------------------------------------------------------------------------
 // 1. Derive public key from MPC contract
@@ -26,25 +99,35 @@ async function callMpcDerivedKey(
   };
   const argsBase64 = btoa(JSON.stringify(args));
 
-  const resp = await fetch(NODE_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: "dpk",
-      method: "query",
-      params: {
-        request_type: "call_function",
-        finality: "final",
-        account_id: MPC_CONTRACT,
-        method_name: "derived_public_key",
-        args_base64: argsBase64,
-      },
-    }),
-  }).then((r) => r.json());
+  let resp: { result?: { result?: number[] } } | undefined;
+  let lastErr: unknown;
+  for (const rpcUrl of NEAR_RPC_URLS) {
+    try {
+      resp = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "dpk",
+          method: "query",
+          params: {
+            request_type: "call_function",
+            finality: "final",
+            account_id: MPC_CONTRACT,
+            method_name: "derived_public_key",
+            args_base64: argsBase64,
+          },
+        }),
+      }).then((r) => r.json());
+      if (resp?.result?.result) break;
+      lastErr = resp;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
 
-  if (!resp.result?.result) {
-    throw new Error("derived_public_key failed: " + JSON.stringify(resp));
+  if (!resp?.result?.result) {
+    throw new Error("derived_public_key failed: " + JSON.stringify(lastErr ?? resp));
   }
   return JSON.parse(
     new TextDecoder().decode(new Uint8Array(resp.result.result)),
@@ -120,49 +203,34 @@ export async function deriveMpcAddress(
 // ---------------------------------------------------------------------------
 
 export async function getEthBalance(address: string): Promise<string> {
-  const resp = await fetch(ETH_RPC, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "eth_getBalance",
-      params: [address, "latest"],
-    }),
-  }).then((r) => r.json());
-  const wei = BigInt(resp.result ?? "0x0");
+  const result = await callRpcWithFallback<string>(
+    ETH_RPCS,
+    "eth_getBalance",
+    [address, "latest"],
+  );
+  const wei = BigInt(result ?? "0x0");
   const eth = Number(wei) / 1e18;
   return eth.toFixed(6) + " ETH";
 }
 
 export async function getSuiBalance(address: string): Promise<string> {
-  const resp = await fetch(SUI_RPC, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "suix_getBalance",
-      params: [address, "0x2::sui::SUI"],
-    }),
-  }).then((r) => r.json());
-  const mist = BigInt(resp.result?.totalBalance ?? "0");
+  const result = await callRpcWithFallback<{ totalBalance?: string }>(
+    SUI_RPCS,
+    "suix_getBalance",
+    [address, "0x2::sui::SUI"],
+  );
+  const mist = BigInt(result?.totalBalance ?? "0");
   const sui = Number(mist) / 1e9;
   return sui.toFixed(6) + " SUI";
 }
 
 export async function getAvaxBalance(address: string): Promise<string> {
-  const resp = await fetch(AVAX_RPC, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "eth_getBalance",
-      params: [address, "latest"],
-    }),
-  }).then((r) => r.json());
-  const wei = BigInt(resp.result ?? "0x0");
+  const result = await callRpcWithFallback<string>(
+    AVAX_RPCS,
+    "eth_getBalance",
+    [address, "latest"],
+  );
+  const wei = BigInt(result ?? "0x0");
   const avax = Number(wei) / 1e18;
   return avax.toFixed(6) + " AVAX";
 }
@@ -192,34 +260,34 @@ export async function buildEthTxPayload(
   amountWei: string,
   path: string,
 ): Promise<TxPayload> {
-  const provider = new ethers.JsonRpcProvider(ETH_RPC);
+  return withEvmProvider(ETH_RPCS, async (provider) => {
+    const nonce = await provider.getTransactionCount(userMpcAddress);
+    const feeData = await provider.getFeeData();
+    const network = await provider.getNetwork();
 
-  const nonce = await provider.getTransactionCount(userMpcAddress);
-  const feeData = await provider.getFeeData();
-  const network = await provider.getNetwork();
+    const tx = new ethers.Transaction();
+    tx.to = poolMpcAddress;
+    tx.value = BigInt(amountWei);
+    tx.gasLimit = 21000n;
+    tx.nonce = nonce;
+    tx.chainId = network.chainId;
+    tx.type = 2;
+    tx.maxFeePerGas = feeData.maxFeePerGas;
+    tx.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
 
-  const tx = new ethers.Transaction();
-  tx.to = poolMpcAddress;
-  tx.value = BigInt(amountWei);
-  tx.gasLimit = 21000n;
-  tx.nonce = nonce;
-  tx.chainId = network.chainId;
-  tx.type = 2;
-  tx.maxFeePerGas = feeData.maxFeePerGas;
-  tx.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+    const payloadBytes = Array.from(ethers.getBytes(tx.unsignedHash));
 
-  const payloadBytes = Array.from(ethers.getBytes(tx.unsignedHash));
-
-  return {
-    chain: "ETH",
-    signScheme: "ECDSA",
-    path,
-    payload: payloadBytes,
-    eddsaPayload: null,
-    fromAddress: userMpcAddress,
-    toAddress: poolMpcAddress,
-    unsignedTxHex: tx.unsignedSerialized,
-  };
+    return {
+      chain: "ETH",
+      signScheme: "ECDSA",
+      path,
+      payload: payloadBytes,
+      eddsaPayload: null,
+      fromAddress: userMpcAddress,
+      toAddress: poolMpcAddress,
+      unsignedTxHex: tx.unsignedSerialized,
+    };
+  });
 }
 
 export async function buildAvaxTxPayload(
@@ -228,34 +296,34 @@ export async function buildAvaxTxPayload(
   amountWei: string,
   path: string,
 ): Promise<TxPayload> {
-  const provider = new ethers.JsonRpcProvider(AVAX_RPC);
+  return withEvmProvider(AVAX_RPCS, async (provider) => {
+    const nonce = await provider.getTransactionCount(userMpcAddress);
+    const feeData = await provider.getFeeData();
+    const network = await provider.getNetwork();
 
-  const nonce = await provider.getTransactionCount(userMpcAddress);
-  const feeData = await provider.getFeeData();
-  const network = await provider.getNetwork();
+    const tx = new ethers.Transaction();
+    tx.to = poolMpcAddress;
+    tx.value = BigInt(amountWei);
+    tx.gasLimit = 21000n;
+    tx.nonce = nonce;
+    tx.chainId = network.chainId;
+    tx.type = 2;
+    tx.maxFeePerGas = feeData.maxFeePerGas;
+    tx.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
 
-  const tx = new ethers.Transaction();
-  tx.to = poolMpcAddress;
-  tx.value = BigInt(amountWei);
-  tx.gasLimit = 21000n;
-  tx.nonce = nonce;
-  tx.chainId = network.chainId;
-  tx.type = 2;
-  tx.maxFeePerGas = feeData.maxFeePerGas;
-  tx.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+    const payloadBytes = Array.from(ethers.getBytes(tx.unsignedHash));
 
-  const payloadBytes = Array.from(ethers.getBytes(tx.unsignedHash));
-
-  return {
-    chain: "AVAX",
-    signScheme: "ECDSA",
-    path,
-    payload: payloadBytes,
-    eddsaPayload: null,
-    fromAddress: userMpcAddress,
-    toAddress: poolMpcAddress,
-    unsignedTxHex: tx.unsignedSerialized,
-  };
+    return {
+      chain: "AVAX",
+      signScheme: "ECDSA",
+      path,
+      payload: payloadBytes,
+      eddsaPayload: null,
+      fromAddress: userMpcAddress,
+      toAddress: poolMpcAddress,
+      unsignedTxHex: tx.unsignedSerialized,
+    };
+  });
 }
 
 // SUI intent message: 3-byte intent prefix + BCS tx bytes
@@ -279,7 +347,7 @@ export async function buildSuiTxPayload(
   amountMist: string,
   path: string,
 ): Promise<TxPayload> {
-  const client = new SuiClient({ url: SUI_RPC });
+  const client = new SuiClient({ url: SUI_RPCS[0] });
 
   const balResp = await client.getBalance({ owner: senderAddress });
   const available = BigInt(balResp.totalBalance);
@@ -340,11 +408,12 @@ export async function buildSettlementPayload(
 
 /**
  * One-call: derive addresses + build tx payload for locking funds.
- * userSellPath: the user's source MPC derivation path (e.g. "eth/1", "eth/myname.testnet")
- * userBuyPath: the user's destination MPC derivation path for receiving (e.g. "sui/1")
+ *
+ * IMPORTANT: this frontend uses a single namespace for all user flows:
+ *   predecessor = CONTRACT_ID
+ * That keeps deposit / settlement / withdraw_from_mpc consistent.
  */
 export async function prepareLockPayload(
-  userAccountId: string,
   sellChain: "ETH" | "SUI" | "AVAX",
   sellAmount: string,
   buyChain: "ETH" | "SUI" | "AVAX",
@@ -361,7 +430,7 @@ export async function prepareLockPayload(
     // must be derived in contract namespace: (CONTRACT_ID + userSellPath)
     deriveMpcAddress(CONTRACT_ID, userSellPath, sellChain),
     deriveMpcAddress(CONTRACT_ID, poolPath, sellChain),
-    deriveMpcAddress(userAccountId, userBuyPath, buyChain),
+    deriveMpcAddress(CONTRACT_ID, userBuyPath, buyChain),
   ]);
 
   let txPayload: TxPayload;
@@ -408,26 +477,43 @@ export async function broadcastEvmTx(
   unsignedTxHex: string,
   sig: SignatureEvent,
 ): Promise<string> {
-  const rpc = sig.chain === "AVAX" ? AVAX_RPC : ETH_RPC;
-  const provider = new ethers.JsonRpcProvider(rpc);
-
-  const tx = ethers.Transaction.from(unsignedTxHex);
-
   const rRaw = sig.big_r.startsWith("0x") ? sig.big_r.slice(2) : sig.big_r;
-  // MPC returns SEC1 compressed point: 02/03 prefix (1 byte) + X coordinate (32 bytes)
-  // ethers.Signature needs only the 32-byte X coordinate
   const rPoint = rRaw.length >= 66 ? rRaw.slice(2) : rRaw;
   const sHex = sig.s.startsWith("0x") ? sig.s.slice(2) : sig.s;
 
+  const tx = ethers.Transaction.from(unsignedTxHex);
   tx.signature = ethers.Signature.from({
     r: "0x" + rPoint,
     s: "0x" + sHex,
     v: sig.recovery_id + 27,
   });
-
   const signedRaw = tx.serialized;
-  const result = await provider.broadcastTransaction(signedRaw);
-  return result.hash;
+
+  const rpcUrls = sig.chain === "AVAX" ? AVAX_RPCS : ETH_RPCS;
+  const txHash = ethers.keccak256(signedRaw);
+
+  let lastErr: unknown;
+  for (const url of rpcUrls) {
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: 1, method: "eth_sendRawTransaction", params: [signedRaw],
+        }),
+      });
+      const data = await resp.json() as { result?: string; error?: { message?: string; code?: number } };
+      if (data.result) return data.result;
+      if (data.error?.message?.toLowerCase().includes("already known") ||
+          data.error?.message?.toLowerCase().includes("nonce too low")) {
+        return txHash;
+      }
+      lastErr = new Error(data.error?.message || JSON.stringify(data));
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(`Broadcast failed: ${(lastErr as Error)?.message || "all RPCs unavailable"}`);
 }
 
 /**
@@ -438,7 +524,7 @@ export async function broadcastSuiTx(
   sig: SignatureEvent,
   signerPath: string,
 ): Promise<string> {
-  const client = new SuiClient({ url: SUI_RPC });
+  const client = new SuiClient({ url: SUI_RPCS[0] });
 
   // Reconstruct 64-byte Ed25519 signature from event fields
   let sigHex = sig.signature || (sig.big_r + sig.s);
